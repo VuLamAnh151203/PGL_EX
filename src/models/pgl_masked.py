@@ -1,11 +1,11 @@
 r"""
 PGL with two-branch masked user-item graph learning.
 
-The full and masked branches share the same initial node embeddings. The
-masked branch learns one soft mask per user-item interaction and can use
-either full-graph degrees or degrees recomputed from the masked weights.
-Their outputs are combined by a learnable gate before adding the multimodal
-item-item representation.
+The two branches share the same initial node embeddings. The second branch
+can use a soft mask, a hard sparse mask, or the complete graph as an ablation.
+Masked modes can use either full-graph degrees or degrees recomputed from the
+masked weights. Branch outputs are combined by a learnable gate before adding
+the multimodal item-item representation.
 """
 
 import math
@@ -45,6 +45,12 @@ class PGL_MASKED(GeneralRecommender):
         self.mask_degree_mode = str(
             _config_value(config, 'mask_degree_mode', 'masked')
         ).lower()
+        self.mask_graph_mode = str(
+            _config_value(config, 'mask_graph_mode', 'soft')
+        ).lower()
+        self.hard_mask_temperature = _config_value(
+            config, 'hard_mask_temperature', 1.0
+        )
 
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
@@ -56,6 +62,12 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError(
                 "mask_degree_mode must be either 'full' or 'masked'."
             )
+        if self.mask_graph_mode not in {'soft', 'hard', 'double_full'}:
+            raise ValueError(
+                "mask_graph_mode must be 'soft', 'hard', or 'double_full'."
+            )
+        if self.hard_mask_temperature <= 0.0:
+            raise ValueError('hard_mask_temperature must be positive.')
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
                 'PGL_MASKED requires both image_feat.npy and text_feat.npy.'
@@ -132,8 +144,17 @@ class PGL_MASKED(GeneralRecommender):
         initial_logit = math.log(
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
-        self.mask_logits = nn.Parameter(
-            torch.full((self.num_interactions,), initial_logit)
+        if self.mask_graph_mode == 'double_full':
+            self.register_parameter('mask_logits', None)
+        else:
+            self.mask_logits = nn.Parameter(
+                torch.full((self.num_interactions,), initial_logit)
+            )
+        self.register_buffer(
+            'hard_train_indices', torch.empty(0, dtype=torch.long)
+        )
+        self.register_buffer(
+            'hard_eval_indices', torch.empty(0, dtype=torch.long)
         )
 
         full_edge_weights = torch.ones(edge_index.size(1), dtype=torch.float32)
@@ -146,8 +167,10 @@ class PGL_MASKED(GeneralRecommender):
         norm_adj = self._ui_adjacency_from_weights(full_norm_edge_weights)
         self.register_buffer('norm_adj', norm_adj)
 
-    def _normalized_ui_edge_weights(self, edge_weights):
-        row, col = self.ui_edge_index
+    def _normalized_ui_edge_weights(self, edge_weights, edge_index=None):
+        if edge_index is None:
+            edge_index = self.ui_edge_index
+        row, col = edge_index
         degree = torch.zeros(
             self.n_nodes,
             dtype=edge_weights.dtype,
@@ -165,20 +188,115 @@ class PGL_MASKED(GeneralRecommender):
         )
         return normalized_weights
 
-    def _ui_adjacency_from_weights(self, edge_weights):
+    def _ui_adjacency_from_weights(self, edge_weights, edge_index=None):
+        if edge_index is None:
+            edge_index = self.ui_edge_index
         return torch.sparse_coo_tensor(
-            self.ui_edge_index,
+            edge_index,
             edge_weights,
             (self.n_nodes, self.n_nodes),
             device=edge_weights.device,
         ).coalesce()
 
-    def _normalized_ui_adjacency(self, edge_weights):
-        normalized_weights = self._normalized_ui_edge_weights(edge_weights)
-        return self._ui_adjacency_from_weights(normalized_weights)
+    def _normalized_ui_adjacency(self, edge_weights, edge_index=None):
+        normalized_weights = self._normalized_ui_edge_weights(
+            edge_weights, edge_index
+        )
+        return self._ui_adjacency_from_weights(
+            normalized_weights, edge_index
+        )
+
+    @property
+    def hard_keep_count(self):
+        return max(
+            1,
+            min(
+                self.num_interactions,
+                int(round(self.num_interactions * self.mask_keep_ratio)),
+            ),
+        )
+
+    @torch.no_grad()
+    def _sample_hard_train_indices(self):
+        uniform_noise = torch.rand_like(self.mask_logits).clamp_(
+            1e-8, 1.0 - 1e-8
+        )
+        gumbel_noise = -torch.log(-torch.log(uniform_noise))
+        selection_scores = (
+            self.mask_logits / self.hard_mask_temperature + gumbel_noise
+        )
+        return torch.topk(
+            selection_scores,
+            self.hard_keep_count,
+            sorted=False,
+        ).indices
+
+    @torch.no_grad()
+    def _select_hard_eval_indices(self):
+        return torch.topk(
+            self.mask_logits,
+            self.hard_keep_count,
+            sorted=False,
+        ).indices
+
+    def pre_epoch_processing(self):
+        if self.mask_graph_mode == 'hard':
+            self.hard_train_indices = self._sample_hard_train_indices()
+
+    def post_epoch_processing(self):
+        if self.mask_graph_mode == 'hard':
+            self.hard_eval_indices = self._select_hard_eval_indices()
+
+    def _current_hard_indices(self):
+        if self.training:
+            if self.hard_train_indices.numel() == 0:
+                self.hard_train_indices = self._sample_hard_train_indices()
+            return self.hard_train_indices
+
+        if self.hard_eval_indices.numel() == 0:
+            self.hard_eval_indices = self._select_hard_eval_indices()
+        return self.hard_eval_indices
+
+    def _hard_masked_ui_adjacency(self, interaction_mask):
+        kept_interactions = self._current_hard_indices()
+        reverse_interactions = kept_interactions + self.num_interactions
+        kept_undirected = torch.cat(
+            (kept_interactions, reverse_interactions), dim=0
+        )
+        hard_edge_index = self.ui_edge_index[:, kept_undirected]
+
+        selected_soft_mask = interaction_mask[kept_interactions]
+        selected_hard_mask = (
+            torch.ones_like(selected_soft_mask)
+            + selected_soft_mask
+            - selected_soft_mask.detach()
+        )
+        hard_undirected_mask = torch.cat(
+            (selected_hard_mask, selected_hard_mask), dim=0
+        )
+
+        if self.mask_degree_mode == 'full':
+            masked_edge_weights = (
+                self.full_norm_edge_weights[kept_undirected]
+                * hard_undirected_mask
+            )
+            return self._ui_adjacency_from_weights(
+                masked_edge_weights, hard_edge_index
+            )
+
+        return self._normalized_ui_adjacency(
+            hard_undirected_mask, hard_edge_index
+        )
 
     def _masked_ui_adjacency(self):
+        if self.mask_graph_mode == 'double_full':
+            return self.norm_adj, None
+
         interaction_mask = torch.sigmoid(self.mask_logits)
+        if self.mask_graph_mode == 'hard':
+            masked_adj = self._hard_masked_ui_adjacency(interaction_mask)
+            return masked_adj, interaction_mask
+
         undirected_mask = torch.cat(
             (interaction_mask, interaction_mask), dim=0
         )
@@ -396,13 +514,18 @@ class PGL_MASKED(GeneralRecommender):
         contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
 
         interaction_mask = representations['mask']
-        budget_loss = (
-            interaction_mask.mean() - self.mask_keep_ratio
-        ).pow(2)
-        binary_loss = (
-            interaction_mask * (1.0 - interaction_mask)
-        ).mean()
-        mask_loss = budget_loss + self.mask_binary_weight * binary_loss
+        if interaction_mask is None:
+            mask_loss = ranking_loss.new_zeros(())
+            mask_mean = ranking_loss.new_ones(())
+        else:
+            budget_loss = (
+                interaction_mask.mean() - self.mask_keep_ratio
+            ).pow(2)
+            binary_loss = (
+                interaction_mask * (1.0 - interaction_mask)
+            ).mean()
+            mask_loss = budget_loss + self.mask_binary_weight * binary_loss
+            mask_mean = interaction_mask.mean()
 
         total_loss = (
             ranking_loss
@@ -413,7 +536,7 @@ class PGL_MASKED(GeneralRecommender):
             'bpr': ranking_loss.detach(),
             'contrastive': contrastive_loss.detach(),
             'mask': mask_loss.detach(),
-            'mask_mean': interaction_mask.mean().detach(),
+            'mask_mean': mask_mean.detach(),
         }
         return total_loss
 
