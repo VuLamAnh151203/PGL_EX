@@ -15,5 +15,7 @@ cl_temperature: 0.2
 mask_weight: 0.1
 mask_keep_ratio: 0.3
 mask_binary_weight: 0.1
+# full: use D_full for faster edge gating; masked: recompute D_mask.
+mask_degree_mode: full
 
 hyper_parameters: []

@@ -2,9 +2,9 @@ r"""
 PGL with two-branch masked user-item graph learning.
 
 The full and masked branches share the same initial node embeddings. The
-masked branch learns one soft mask per user-item interaction and recomputes
-the symmetric degree normalization from the masked edge weights. Their
-outputs are combined by a learnable gate before adding the multimodal
+masked branch learns one soft mask per user-item interaction and can use
+either full-graph degrees or degrees recomputed from the masked weights.
+Their outputs are combined by a learnable gate before adding the multimodal
 item-item representation.
 """
 
@@ -42,6 +42,9 @@ class PGL_MASKED(GeneralRecommender):
         self.mask_binary_weight = _config_value(
             config, 'mask_binary_weight', 0.1
         )
+        self.mask_degree_mode = str(
+            _config_value(config, 'mask_degree_mode', 'masked')
+        ).lower()
 
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
@@ -49,6 +52,10 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError('cl_temperature must be positive.')
         if self.knn_k <= 0:
             raise ValueError('knn_k must be positive.')
+        if self.mask_degree_mode not in {'full', 'masked'}:
+            raise ValueError(
+                "mask_degree_mode must be either 'full' or 'masked'."
+            )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
                 'PGL_MASKED requires both image_feat.npy and text_feat.npy.'
@@ -130,10 +137,16 @@ class PGL_MASKED(GeneralRecommender):
         )
 
         full_edge_weights = torch.ones(edge_index.size(1), dtype=torch.float32)
-        norm_adj = self._normalized_ui_adjacency(full_edge_weights)
+        full_norm_edge_weights = self._normalized_ui_edge_weights(
+            full_edge_weights
+        )
+        self.register_buffer(
+            'full_norm_edge_weights', full_norm_edge_weights
+        )
+        norm_adj = self._ui_adjacency_from_weights(full_norm_edge_weights)
         self.register_buffer('norm_adj', norm_adj)
 
-    def _normalized_ui_adjacency(self, edge_weights):
+    def _normalized_ui_edge_weights(self, edge_weights):
         row, col = self.ui_edge_index
         degree = torch.zeros(
             self.n_nodes,
@@ -150,19 +163,34 @@ class PGL_MASKED(GeneralRecommender):
         normalized_weights = (
             degree_inv_sqrt[row] * edge_weights * degree_inv_sqrt[col]
         )
+        return normalized_weights
+
+    def _ui_adjacency_from_weights(self, edge_weights):
         return torch.sparse_coo_tensor(
             self.ui_edge_index,
-            normalized_weights,
+            edge_weights,
             (self.n_nodes, self.n_nodes),
             device=edge_weights.device,
         ).coalesce()
+
+    def _normalized_ui_adjacency(self, edge_weights):
+        normalized_weights = self._normalized_ui_edge_weights(edge_weights)
+        return self._ui_adjacency_from_weights(normalized_weights)
 
     def _masked_ui_adjacency(self):
         interaction_mask = torch.sigmoid(self.mask_logits)
         undirected_mask = torch.cat(
             (interaction_mask, interaction_mask), dim=0
         )
-        masked_adj = self._normalized_ui_adjacency(undirected_mask)
+        if self.mask_degree_mode == 'full':
+            masked_edge_weights = (
+                self.full_norm_edge_weights * undirected_mask
+            )
+            masked_adj = self._ui_adjacency_from_weights(
+                masked_edge_weights
+            )
+        else:
+            masked_adj = self._normalized_ui_adjacency(undirected_mask)
         return masked_adj, interaction_mask
 
     def _build_or_load_mm_graph(self, config):
