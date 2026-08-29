@@ -12,6 +12,7 @@ mm_image_weight: 0.1
 # Two-branch masked user-item graph learning.
 cl_weight: 0.05
 cl_temperature: 0.2
+dropout: 0.2
 mask_weight: 0.1
 mask_keep_ratio: 0.3
 mask_binary_weight: 0.1
@@ -23,6 +24,8 @@ mask_degree_mode: full
 mask_graph_mode: hard
 # shared: both branches share user tables; separate: one table pair per branch.
 user_embedding_mode: separate
+# dual: full + second branch; masked_only: skip full branch and gated fusion.
+ui_branch_mode: masked_only
 # Controls stochastic Gumbel top-k exploration during training.
 hard_mask_temperature: 1.0
 

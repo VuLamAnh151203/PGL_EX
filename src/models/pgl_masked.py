@@ -37,6 +37,7 @@ class PGL_MASKED(GeneralRecommender):
 
         self.cl_weight = _config_value(config, 'cl_weight', 0.05)
         self.cl_temperature = _config_value(config, 'cl_temperature', 0.2)
+        self.cl_dropout = _config_value(config, 'dropout', 0.2)
         self.mask_weight = _config_value(config, 'mask_weight', 0.1)
         self.mask_keep_ratio = _config_value(config, 'mask_keep_ratio', 0.3)
         self.mask_binary_weight = _config_value(
@@ -54,11 +55,16 @@ class PGL_MASKED(GeneralRecommender):
         self.user_embedding_mode = str(
             _config_value(config, 'user_embedding_mode', 'shared')
         ).lower()
+        self.ui_branch_mode = str(
+            _config_value(config, 'ui_branch_mode', 'dual')
+        ).lower()
 
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
         if self.cl_temperature <= 0.0:
             raise ValueError('cl_temperature must be positive.')
+        if not 0.0 <= self.cl_dropout < 1.0:
+            raise ValueError('dropout must be in the interval [0, 1).')
         if self.knn_k <= 0:
             raise ValueError('knn_k must be positive.')
         if self.mask_degree_mode not in {'full', 'masked'}:
@@ -74,6 +80,10 @@ class PGL_MASKED(GeneralRecommender):
         if self.user_embedding_mode not in {'shared', 'separate'}:
             raise ValueError(
                 "user_embedding_mode must be either 'shared' or 'separate'."
+            )
+        if self.ui_branch_mode not in {'dual', 'masked_only'}:
+            raise ValueError(
+                "ui_branch_mode must be either 'dual' or 'masked_only'."
             )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
@@ -101,7 +111,10 @@ class PGL_MASKED(GeneralRecommender):
         nn.init.xavier_uniform_(self.user_text.weight)
         nn.init.xavier_uniform_(self.user_image.weight)
 
-        if self.user_embedding_mode == 'separate':
+        if (
+            self.user_embedding_mode == 'separate'
+            and self.ui_branch_mode == 'dual'
+        ):
             self.second_user_text = nn.Embedding(
                 self.n_users, self.embedding_dim
             )
@@ -143,6 +156,7 @@ class PGL_MASKED(GeneralRecommender):
         )
         nn.init.xavier_uniform_(self.fusion_gate.weight)
         nn.init.zeros_(self.fusion_gate.bias)
+        self.cl_dropout_layer = nn.Dropout(self.cl_dropout)
 
         self._build_or_load_mm_graph(config)
         self.latest_loss_components = {}
@@ -420,7 +434,7 @@ class PGL_MASKED(GeneralRecommender):
         user_embeddings = torch.cat(
             (self.user_image.weight, self.user_text.weight), dim=1
         )
-        if self.user_embedding_mode == 'separate':
+        if self.second_user_image is not None:
             second_user_embeddings = torch.cat(
                 (
                     self.second_user_image.weight,
@@ -469,12 +483,28 @@ class PGL_MASKED(GeneralRecommender):
             multimodal_items,
         ) = self._initial_node_embeddings()
 
-        full_embeddings = self._propagate_ui_graph(
-            self.norm_adj, full_initial_embeddings
-        )
         masked_adj, interaction_mask = self._masked_ui_adjacency()
         masked_embeddings = self._propagate_ui_graph(
             masked_adj, second_initial_embeddings
+        )
+
+        if self.ui_branch_mode == 'masked_only':
+            masked_users, masked_items = torch.split(
+                masked_embeddings, [self.n_users, self.n_items], dim=0
+            )
+            mm_items = self._propagate_mm_graph(multimodal_items)
+            return {
+                'users': masked_users,
+                'items': masked_items + mm_items,
+                'full_users': None,
+                'full_items': None,
+                'masked_users': masked_users,
+                'masked_items': masked_items,
+                'mask': interaction_mask,
+            }
+
+        full_embeddings = self._propagate_ui_graph(
+            self.norm_adj, full_initial_embeddings
         )
 
         branch_embeddings = torch.cat(
@@ -530,6 +560,15 @@ class PGL_MASKED(GeneralRecommender):
             + F.cross_entropy(logits.transpose(0, 1), labels)
         )
 
+    def pgl_info_nce(self, first_view, second_view):
+        """One-direction InfoNCE used by the original PGL implementation."""
+        first_view = F.normalize(first_view, dim=1)
+        second_view = F.normalize(second_view, dim=1)
+        logits = torch.matmul(first_view, second_view.transpose(0, 1))
+        logits = logits / self.cl_temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)
+
     def calculate_loss(self, interaction):
         users = interaction[0]
         positive_items = interaction[1]
@@ -543,17 +582,30 @@ class PGL_MASKED(GeneralRecommender):
             user_embeddings, positive_embeddings, negative_embeddings
         )
 
-        unique_users = torch.unique(users)
-        unique_items = torch.unique(positive_items)
-        user_cl_loss = self.info_nce(
-            representations['full_users'][unique_users],
-            representations['masked_users'][unique_users],
-        )
-        item_cl_loss = self.info_nce(
-            representations['full_items'][unique_items],
-            representations['masked_items'][unique_items],
-        )
-        contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
+        if self.cl_weight == 0.0:
+            contrastive_loss = ranking_loss.new_zeros(())
+        elif representations['full_users'] is None:
+            user_cl_loss = self.pgl_info_nce(
+                self.cl_dropout_layer(user_embeddings),
+                self.cl_dropout_layer(user_embeddings),
+            )
+            item_cl_loss = self.pgl_info_nce(
+                self.cl_dropout_layer(positive_embeddings),
+                self.cl_dropout_layer(positive_embeddings),
+            )
+            contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
+        else:
+            unique_users = torch.unique(users)
+            unique_items = torch.unique(positive_items)
+            user_cl_loss = self.info_nce(
+                representations['full_users'][unique_users],
+                representations['masked_users'][unique_users],
+            )
+            item_cl_loss = self.info_nce(
+                representations['full_items'][unique_items],
+                representations['masked_items'][unique_items],
+            )
+            contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
 
         interaction_mask = representations['mask']
         if interaction_mask is None:
