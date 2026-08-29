@@ -155,15 +155,15 @@ class PGL(GeneralRecommender):
         return torch.sparse.FloatTensor(indices, values, adj_size)
 
     def get_norm_adj_mat(self):
-        A = sp.dok_matrix((self.n_users + self.n_items,
-                           self.n_users + self.n_items), dtype=np.float64)
         inter_M = self.interaction_matrix
-        inter_M_t = self.interaction_matrix.transpose()
-        data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users),
-                             [1] * inter_M.nnz))
-        data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col),
-                                  [1] * inter_M_t.nnz)))
-        A.update(data_dict)
+        rows = np.concatenate((inter_M.row, inter_M.col + self.n_users))
+        cols = np.concatenate((inter_M.col + self.n_users, inter_M.row))
+        A = sp.coo_matrix(
+            (np.ones(rows.size, dtype=np.float64), (rows, cols)),
+            shape=(self.n_nodes, self.n_nodes),
+        ).tocsr()
+        # Keep the graph binary if the interaction matrix contains duplicates.
+        A.data.fill(1.0)
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid Devide by zero Warning
