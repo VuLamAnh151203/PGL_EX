@@ -21,6 +21,8 @@ mask_degree_mode: full
 # double_full: no mask, both branches use the complete U-I graph.
 # mask_graph_mode: double_full
 mask_graph_mode: hard
+# shared: both branches share user tables; separate: one table pair per branch.
+user_embedding_mode: separate
 # Controls stochastic Gumbel top-k exploration during training.
 hard_mask_temperature: 1.0
 

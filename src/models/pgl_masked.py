@@ -51,6 +51,9 @@ class PGL_MASKED(GeneralRecommender):
         self.hard_mask_temperature = _config_value(
             config, 'hard_mask_temperature', 1.0
         )
+        self.user_embedding_mode = str(
+            _config_value(config, 'user_embedding_mode', 'shared')
+        ).lower()
 
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
@@ -68,6 +71,10 @@ class PGL_MASKED(GeneralRecommender):
             )
         if self.hard_mask_temperature <= 0.0:
             raise ValueError('hard_mask_temperature must be positive.')
+        if self.user_embedding_mode not in {'shared', 'separate'}:
+            raise ValueError(
+                "user_embedding_mode must be either 'shared' or 'separate'."
+            )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
                 'PGL_MASKED requires both image_feat.npy and text_feat.npy.'
@@ -93,6 +100,19 @@ class PGL_MASKED(GeneralRecommender):
         self.user_image = nn.Embedding(self.n_users, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_text.weight)
         nn.init.xavier_uniform_(self.user_image.weight)
+
+        if self.user_embedding_mode == 'separate':
+            self.second_user_text = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            self.second_user_image = nn.Embedding(
+                self.n_users, self.embedding_dim
+            )
+            nn.init.xavier_uniform_(self.second_user_text.weight)
+            nn.init.xavier_uniform_(self.second_user_image.weight)
+        else:
+            self.second_user_text = None
+            self.second_user_image = None
 
         self.image_embedding = nn.Embedding.from_pretrained(
             self.v_feat, freeze=False
@@ -400,11 +420,29 @@ class PGL_MASKED(GeneralRecommender):
         user_embeddings = torch.cat(
             (self.user_image.weight, self.user_text.weight), dim=1
         )
+        if self.user_embedding_mode == 'separate':
+            second_user_embeddings = torch.cat(
+                (
+                    self.second_user_image.weight,
+                    self.second_user_text.weight,
+                ),
+                dim=1,
+            )
+        else:
+            second_user_embeddings = user_embeddings
+
         ui_item_embeddings = self.item_ui_projection(multimodal_items)
-        initial_embeddings = torch.cat(
+        full_initial_embeddings = torch.cat(
             (user_embeddings, ui_item_embeddings), dim=0
         )
-        return initial_embeddings, multimodal_items
+        second_initial_embeddings = torch.cat(
+            (second_user_embeddings, ui_item_embeddings), dim=0
+        )
+        return (
+            full_initial_embeddings,
+            second_initial_embeddings,
+            multimodal_items,
+        )
 
     def _propagate_ui_graph(self, adjacency, initial_embeddings):
         embeddings = [initial_embeddings]
@@ -425,14 +463,18 @@ class PGL_MASKED(GeneralRecommender):
         return self.mm_output_projection(propagated_items)
 
     def _encode(self):
-        initial_embeddings, multimodal_items = self._initial_node_embeddings()
+        (
+            full_initial_embeddings,
+            second_initial_embeddings,
+            multimodal_items,
+        ) = self._initial_node_embeddings()
 
         full_embeddings = self._propagate_ui_graph(
-            self.norm_adj, initial_embeddings
+            self.norm_adj, full_initial_embeddings
         )
         masked_adj, interaction_mask = self._masked_ui_adjacency()
         masked_embeddings = self._propagate_ui_graph(
-            masked_adj, initial_embeddings
+            masked_adj, second_initial_embeddings
         )
 
         branch_embeddings = torch.cat(
