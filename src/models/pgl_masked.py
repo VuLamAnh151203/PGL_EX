@@ -81,9 +81,12 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError(
                 "user_embedding_mode must be either 'shared' or 'separate'."
             )
-        if self.ui_branch_mode not in {'dual', 'masked_only'}:
+        if self.ui_branch_mode not in {
+            'dual', 'masked_only', 'dual_modal'
+        }:
             raise ValueError(
-                "ui_branch_mode must be either 'dual' or 'masked_only'."
+                "ui_branch_mode must be 'dual', 'masked_only', "
+                "or 'dual_modal'."
             )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
@@ -93,6 +96,13 @@ class PGL_MASKED(GeneralRecommender):
         self.n_nodes = self.n_users + self.n_items
         self.ui_embedding_dim = 2 * self.embedding_dim
         self.mm_embedding_dim = 2 * self.feat_embed_dim
+        if (
+            self.ui_branch_mode == 'dual_modal'
+            and self.embedding_dim != self.feat_embed_dim
+        ):
+            raise ValueError(
+                'dual_modal requires embedding_size == feat_embed_dim.'
+            )
 
         # Use a binary, duplicate-free interaction matrix so one learnable
         # logit always corresponds to exactly one undirected interaction.
@@ -184,11 +194,26 @@ class PGL_MASKED(GeneralRecommender):
             self.mask_logits = nn.Parameter(
                 torch.full((self.num_interactions,), initial_logit)
             )
+        if (
+            self.ui_branch_mode == 'dual_modal'
+            and self.mask_graph_mode != 'double_full'
+        ):
+            self.second_mask_logits = nn.Parameter(
+                torch.full((self.num_interactions,), initial_logit)
+            )
+        else:
+            self.register_parameter('second_mask_logits', None)
         self.register_buffer(
             'hard_train_indices', torch.empty(0, dtype=torch.long)
         )
         self.register_buffer(
             'hard_eval_indices', torch.empty(0, dtype=torch.long)
+        )
+        self.register_buffer(
+            'second_hard_train_indices', torch.empty(0, dtype=torch.long)
+        )
+        self.register_buffer(
+            'second_hard_eval_indices', torch.empty(0, dtype=torch.long)
         )
 
         full_edge_weights = torch.ones(edge_index.size(1), dtype=torch.float32)
@@ -251,13 +276,13 @@ class PGL_MASKED(GeneralRecommender):
         )
 
     @torch.no_grad()
-    def _sample_hard_train_indices(self):
-        uniform_noise = torch.rand_like(self.mask_logits).clamp_(
+    def _sample_hard_train_indices(self, mask_logits):
+        uniform_noise = torch.rand_like(mask_logits).clamp_(
             1e-8, 1.0 - 1e-8
         )
         gumbel_noise = -torch.log(-torch.log(uniform_noise))
         selection_scores = (
-            self.mask_logits / self.hard_mask_temperature + gumbel_noise
+            mask_logits / self.hard_mask_temperature + gumbel_noise
         )
         return torch.topk(
             selection_scores,
@@ -266,33 +291,73 @@ class PGL_MASKED(GeneralRecommender):
         ).indices
 
     @torch.no_grad()
-    def _select_hard_eval_indices(self):
+    def _select_hard_eval_indices(self, mask_logits):
         return torch.topk(
-            self.mask_logits,
+            mask_logits,
             self.hard_keep_count,
             sorted=False,
         ).indices
 
     def pre_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
-            self.hard_train_indices = self._sample_hard_train_indices()
+            self.hard_train_indices = self._sample_hard_train_indices(
+                self.mask_logits
+            )
+            if self.second_mask_logits is not None:
+                self.second_hard_train_indices = (
+                    self._sample_hard_train_indices(
+                        self.second_mask_logits
+                    )
+                )
 
     def post_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
-            self.hard_eval_indices = self._select_hard_eval_indices()
+            self.hard_eval_indices = self._select_hard_eval_indices(
+                self.mask_logits
+            )
+            if self.second_mask_logits is not None:
+                self.second_hard_eval_indices = (
+                    self._select_hard_eval_indices(
+                        self.second_mask_logits
+                    )
+                )
 
-    def _current_hard_indices(self):
+    def _current_hard_indices(self, second_branch=False):
+        mask_logits = (
+            self.second_mask_logits if second_branch else self.mask_logits
+        )
+        train_indices = (
+            self.second_hard_train_indices
+            if second_branch
+            else self.hard_train_indices
+        )
+        eval_indices = (
+            self.second_hard_eval_indices
+            if second_branch
+            else self.hard_eval_indices
+        )
+
         if self.training:
-            if self.hard_train_indices.numel() == 0:
-                self.hard_train_indices = self._sample_hard_train_indices()
-            return self.hard_train_indices
+            if train_indices.numel() == 0:
+                train_indices = self._sample_hard_train_indices(mask_logits)
+                if second_branch:
+                    self.second_hard_train_indices = train_indices
+                else:
+                    self.hard_train_indices = train_indices
+            return train_indices
 
-        if self.hard_eval_indices.numel() == 0:
-            self.hard_eval_indices = self._select_hard_eval_indices()
-        return self.hard_eval_indices
+        if eval_indices.numel() == 0:
+            eval_indices = self._select_hard_eval_indices(mask_logits)
+            if second_branch:
+                self.second_hard_eval_indices = eval_indices
+            else:
+                self.hard_eval_indices = eval_indices
+        return eval_indices
 
-    def _hard_masked_ui_adjacency(self, interaction_mask):
-        kept_interactions = self._current_hard_indices()
+    def _hard_masked_ui_adjacency(
+        self, interaction_mask, second_branch=False
+    ):
+        kept_interactions = self._current_hard_indices(second_branch)
         reverse_interactions = kept_interactions + self.num_interactions
         kept_undirected = torch.cat(
             (kept_interactions, reverse_interactions), dim=0
@@ -322,13 +387,18 @@ class PGL_MASKED(GeneralRecommender):
             hard_undirected_mask, hard_edge_index
         )
 
-    def _masked_ui_adjacency(self):
+    def _masked_ui_adjacency(self, second_branch=False):
         if self.mask_graph_mode == 'double_full':
             return self.norm_adj, None
 
-        interaction_mask = torch.sigmoid(self.mask_logits)
+        mask_logits = (
+            self.second_mask_logits if second_branch else self.mask_logits
+        )
+        interaction_mask = torch.sigmoid(mask_logits)
         if self.mask_graph_mode == 'hard':
-            masked_adj = self._hard_masked_ui_adjacency(interaction_mask)
+            masked_adj = self._hard_masked_ui_adjacency(
+                interaction_mask, second_branch
+            )
             return masked_adj, interaction_mask
 
         undirected_mask = torch.cat(
@@ -456,6 +526,8 @@ class PGL_MASKED(GeneralRecommender):
             full_initial_embeddings,
             second_initial_embeddings,
             multimodal_items,
+            image_features,
+            text_features,
         )
 
     def _propagate_ui_graph(self, adjacency, initial_embeddings):
@@ -476,12 +548,69 @@ class PGL_MASKED(GeneralRecommender):
             )
         return self.mm_output_projection(propagated_items)
 
+    def _encode_dual_modal(
+        self, image_features, text_features, multimodal_items
+    ):
+        visual_user_embeddings = self.user_image.weight
+        if self.user_embedding_mode == 'separate':
+            text_user_embeddings = self.user_text.weight
+        else:
+            text_user_embeddings = visual_user_embeddings
+
+        visual_initial_embeddings = torch.cat(
+            (visual_user_embeddings, image_features), dim=0
+        )
+        text_initial_embeddings = torch.cat(
+            (text_user_embeddings, text_features), dim=0
+        )
+
+        visual_adj, visual_mask = self._masked_ui_adjacency(
+            second_branch=False
+        )
+        text_adj, text_mask = self._masked_ui_adjacency(
+            second_branch=True
+        )
+        visual_embeddings = self._propagate_ui_graph(
+            visual_adj, visual_initial_embeddings
+        )
+        text_embeddings = self._propagate_ui_graph(
+            text_adj, text_initial_embeddings
+        )
+
+        visual_users, visual_items = torch.split(
+            visual_embeddings, [self.n_users, self.n_items], dim=0
+        )
+        text_users, text_items = torch.split(
+            text_embeddings, [self.n_users, self.n_items], dim=0
+        )
+        final_users = torch.cat((visual_users, text_users), dim=1)
+        ui_items = torch.cat((visual_items, text_items), dim=1)
+        mm_items = self._propagate_mm_graph(multimodal_items)
+
+        return {
+            'users': final_users,
+            'items': ui_items + mm_items,
+            'full_users': visual_users,
+            'full_items': visual_items,
+            'masked_users': text_users,
+            'masked_items': text_items,
+            'mask': visual_mask,
+            'second_mask': text_mask,
+        }
+
     def _encode(self):
         (
             full_initial_embeddings,
             second_initial_embeddings,
             multimodal_items,
+            image_features,
+            text_features,
         ) = self._initial_node_embeddings()
+
+        if self.ui_branch_mode == 'dual_modal':
+            return self._encode_dual_modal(
+                image_features, text_features, multimodal_items
+            )
 
         masked_adj, interaction_mask = self._masked_ui_adjacency()
         masked_embeddings = self._propagate_ui_graph(
@@ -501,6 +630,7 @@ class PGL_MASKED(GeneralRecommender):
                 'masked_users': masked_users,
                 'masked_items': masked_items,
                 'mask': interaction_mask,
+                'second_mask': None,
             }
 
         full_embeddings = self._propagate_ui_graph(
@@ -537,6 +667,7 @@ class PGL_MASKED(GeneralRecommender):
             'masked_users': masked_users,
             'masked_items': masked_items,
             'mask': interaction_mask,
+            'second_mask': None,
         }
 
     def forward(self):
@@ -607,19 +738,34 @@ class PGL_MASKED(GeneralRecommender):
             )
             contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
 
-        interaction_mask = representations['mask']
-        if interaction_mask is None:
+        interaction_masks = [
+            mask
+            for mask in (
+                representations['mask'],
+                representations['second_mask'],
+            )
+            if mask is not None
+        ]
+        if not interaction_masks:
             mask_loss = ranking_loss.new_zeros(())
             mask_mean = ranking_loss.new_ones(())
         else:
-            budget_loss = (
-                interaction_mask.mean() - self.mask_keep_ratio
-            ).pow(2)
-            binary_loss = (
-                interaction_mask * (1.0 - interaction_mask)
-            ).mean()
-            mask_loss = budget_loss + self.mask_binary_weight * binary_loss
-            mask_mean = interaction_mask.mean()
+            branch_mask_losses = []
+            branch_mask_means = []
+            for interaction_mask in interaction_masks:
+                mask_mean_for_branch = interaction_mask.mean()
+                budget_loss = (
+                    mask_mean_for_branch - self.mask_keep_ratio
+                ).pow(2)
+                binary_loss = (
+                    interaction_mask * (1.0 - interaction_mask)
+                ).mean()
+                branch_mask_losses.append(
+                    budget_loss + self.mask_binary_weight * binary_loss
+                )
+                branch_mask_means.append(mask_mean_for_branch)
+            mask_loss = torch.stack(branch_mask_losses).mean()
+            mask_mean = torch.stack(branch_mask_means).mean()
 
         total_loss = (
             ranking_loss
