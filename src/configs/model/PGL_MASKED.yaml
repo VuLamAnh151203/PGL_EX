@@ -1,0 +1,19 @@
+embedding_size: 64
+feat_embed_dim: 64
+
+learning_rate_scheduler: [0.96, 50]
+learning_rate: 0.001
+
+n_mm_layers: 1
+n_ui_layers: 2
+knn_k: 10
+mm_image_weight: 0.1
+
+# Two-branch masked user-item graph learning.
+cl_weight: 0.05
+cl_temperature: 0.2
+mask_weight: 0.1
+mask_keep_ratio: 0.3
+mask_binary_weight: 0.1
+
+hyper_parameters: []
