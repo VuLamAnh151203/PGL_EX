@@ -34,6 +34,12 @@ class PGL_MASKED(GeneralRecommender):
         self.n_mm_layers = _config_value(config, 'n_mm_layers', 1)
         self.n_ui_layers = _config_value(config, 'n_ui_layers', 2)
         self.mm_image_weight = _config_value(config, 'mm_image_weight', 0.1)
+        self.dual_modal_branch_dim = _config_value(
+            config, 'dual_modal_branch_dim', 128
+        )
+        self.dual_modal_output_dim = _config_value(
+            config, 'dual_modal_output_dim', 128
+        )
 
         self.cl_weight = _config_value(config, 'cl_weight', 0.05)
         self.cl_temperature = _config_value(config, 'cl_temperature', 0.2)
@@ -67,6 +73,10 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError('dropout must be in the interval [0, 1).')
         if self.knn_k <= 0:
             raise ValueError('knn_k must be positive.')
+        if self.dual_modal_branch_dim <= 0:
+            raise ValueError('dual_modal_branch_dim must be positive.')
+        if self.dual_modal_output_dim <= 0:
+            raise ValueError('dual_modal_output_dim must be positive.')
         if self.mask_degree_mode not in {'full', 'masked'}:
             raise ValueError(
                 "mask_degree_mode must be either 'full' or 'masked'."
@@ -96,13 +106,11 @@ class PGL_MASKED(GeneralRecommender):
         self.n_nodes = self.n_users + self.n_items
         self.ui_embedding_dim = 2 * self.embedding_dim
         self.mm_embedding_dim = 2 * self.feat_embed_dim
-        if (
-            self.ui_branch_mode == 'dual_modal'
-            and self.embedding_dim != self.feat_embed_dim
-        ):
-            raise ValueError(
-                'dual_modal requires embedding_size == feat_embed_dim.'
-            )
+        self.final_embedding_dim = (
+            self.dual_modal_output_dim
+            if self.ui_branch_mode == 'dual_modal'
+            else self.ui_embedding_dim
+        )
 
         # Use a binary, duplicate-free interaction matrix so one learnable
         # logit always corresponds to exactly one undirected interaction.
@@ -116,8 +124,13 @@ class PGL_MASKED(GeneralRecommender):
 
         self._build_ui_graph()
 
-        self.user_text = nn.Embedding(self.n_users, self.embedding_dim)
-        self.user_image = nn.Embedding(self.n_users, self.embedding_dim)
+        user_table_dim = (
+            self.dual_modal_branch_dim
+            if self.ui_branch_mode == 'dual_modal'
+            else self.embedding_dim
+        )
+        self.user_text = nn.Embedding(self.n_users, user_table_dim)
+        self.user_image = nn.Embedding(self.n_users, user_table_dim)
         nn.init.xavier_uniform_(self.user_text.weight)
         nn.init.xavier_uniform_(self.user_image.weight)
 
@@ -150,7 +163,25 @@ class PGL_MASKED(GeneralRecommender):
             self.t_feat.shape[1], self.feat_embed_dim
         )
 
-        if self.mm_embedding_dim == self.ui_embedding_dim:
+        if self.ui_branch_mode == 'dual_modal':
+            self.dual_modal_image_trs = nn.Linear(
+                self.v_feat.shape[1], self.dual_modal_branch_dim
+            )
+            self.dual_modal_text_trs = nn.Linear(
+                self.t_feat.shape[1], self.dual_modal_branch_dim
+            )
+            self.dual_modal_fusion = nn.Linear(
+                2 * self.dual_modal_branch_dim,
+                self.dual_modal_output_dim,
+            )
+            nn.init.xavier_uniform_(self.dual_modal_fusion.weight)
+            nn.init.zeros_(self.dual_modal_fusion.bias)
+        else:
+            self.dual_modal_image_trs = None
+            self.dual_modal_text_trs = None
+            self.dual_modal_fusion = None
+
+        if self.mm_embedding_dim == self.final_embedding_dim:
             self.item_ui_projection = nn.Identity()
             self.mm_output_projection = nn.Identity()
         else:
@@ -158,7 +189,7 @@ class PGL_MASKED(GeneralRecommender):
                 self.mm_embedding_dim, self.ui_embedding_dim
             )
             self.mm_output_projection = nn.Linear(
-                self.mm_embedding_dim, self.ui_embedding_dim
+                self.mm_embedding_dim, self.final_embedding_dim
             )
 
         self.fusion_gate = nn.Linear(
@@ -501,6 +532,9 @@ class PGL_MASKED(GeneralRecommender):
             (image_features, text_features), dim=1
         )
 
+        if self.ui_branch_mode == 'dual_modal':
+            return None, None, multimodal_items, image_features, text_features
+
         user_embeddings = torch.cat(
             (self.user_image.weight, self.user_text.weight), dim=1
         )
@@ -549,8 +583,14 @@ class PGL_MASKED(GeneralRecommender):
         return self.mm_output_projection(propagated_items)
 
     def _encode_dual_modal(
-        self, image_features, text_features, multimodal_items
+        self, multimodal_items
     ):
+        image_features = F.normalize(
+            self.dual_modal_image_trs(self.image_embedding.weight), dim=-1
+        )
+        text_features = F.normalize(
+            self.dual_modal_text_trs(self.text_embedding.weight), dim=-1
+        )
         visual_user_embeddings = self.user_image.weight
         if self.user_embedding_mode == 'separate':
             text_user_embeddings = self.user_text.weight
@@ -583,8 +623,14 @@ class PGL_MASKED(GeneralRecommender):
         text_users, text_items = torch.split(
             text_embeddings, [self.n_users, self.n_items], dim=0
         )
-        final_users = torch.cat((visual_users, text_users), dim=1)
-        ui_items = torch.cat((visual_items, text_items), dim=1)
+        concatenated_users = torch.cat(
+            (visual_users, text_users), dim=1
+        )
+        concatenated_items = torch.cat(
+            (visual_items, text_items), dim=1
+        )
+        final_users = self.dual_modal_fusion(concatenated_users)
+        ui_items = self.dual_modal_fusion(concatenated_items)
         mm_items = self._propagate_mm_graph(multimodal_items)
 
         return {
@@ -608,9 +654,7 @@ class PGL_MASKED(GeneralRecommender):
         ) = self._initial_node_embeddings()
 
         if self.ui_branch_mode == 'dual_modal':
-            return self._encode_dual_modal(
-                image_features, text_features, multimodal_items
-            )
+            return self._encode_dual_modal(multimodal_items)
 
         masked_adj, interaction_mask = self._masked_ui_adjacency()
         masked_embeddings = self._propagate_ui_graph(

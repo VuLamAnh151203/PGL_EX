@@ -1,5 +1,8 @@
 embedding_size: 64
 feat_embed_dim: 64
+# Each visual/text U-I branch is 128D; concat 256D is projected to 128D.
+dual_modal_branch_dim: 128
+dual_modal_output_dim: 128
 
 learning_rate_scheduler: [0.96, 50]
 learning_rate: 0.001
