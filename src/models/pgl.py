@@ -1,7 +1,9 @@
-# coding: utf-8
-# @email: y463213402@gmail.com
 r"""
-PGL: Mind Individual Information! Principal Graph Learning for Multimedia Recommendation
+PGL
+################################################
+Reference:
+    https://github.com/demonph10/PGL
+    AAAI'2025: [Mind Individual Information! Principal Graph Learning for Multimedia Recommendation]
 """
 
 import os
@@ -12,7 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.abstract_recommender import GeneralRecommender
-from sparsesvd import sparsesvd
+# from sparsesvd import sparsesvd
+from scipy.sparse.linalg import svds
 
 
 class PGL(GeneralRecommender):
@@ -28,13 +31,23 @@ class PGL(GeneralRecommender):
         self.n_ui_layers = config['n_ui_layers']
         self.reg_weight = config['reg_weight']
         self.mm_image_weight = config['mm_image_weight']
+        self.predefined_epoch = config['predefined_epoch']
 
         self.n_nodes = self.n_users + self.n_items
 
         self.sub_graph, self.mm_adj = None, None
 
+        # self.device = "cuda:2"
+        print(self.device)
+
         # load dataset info
-        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float32)
+        self.interaction_matrix = dataset.inter_matrix(form='coo').astype(np.float64)
+
+        item_degrees = (self.interaction_matrix > 0).sum(axis=0).A1
+        self.item_degrees = torch.tensor(item_degrees, dtype=torch.float64).to(self.device).view(-1, 1)
+        self.degree_gate = nn.Linear(1, 1).to(self.device)
+        nn.init.xavier_uniform_(self.degree_gate.weight)
+
         self.norm_adj = self.get_norm_adj_mat().to(self.device)
         self.edge_indices, self.edge_values = self.get_edge_info()
         self.edge_indices, self.edge_values = self.edge_indices.to(self.device), self.edge_values.to(self.device)
@@ -44,6 +57,11 @@ class PGL(GeneralRecommender):
         self.user_image = nn.Embedding(self.n_users, self.embedding_dim)
         nn.init.xavier_uniform_(self.user_image.weight)
         nn.init.xavier_uniform_(self.user_text.weight)
+
+        # self.user_embedding = nn.Embedding(self.n_users, self.embedding_dim).to(self.device)
+        # self.item_id_embedding = nn.Embedding(self.n_items, self.embedding_dim).to(self.device)
+        # nn.init.xavier_uniform_(self.user_embedding.weight)
+        # nn.init.xavier_uniform_(self.item_id_embedding.weight)
 
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
         mm_adj_file = os.path.join(dataset_path,'mm_adj_freedomdsp_{}_{}.pt'.format(self.knn_k, int(10 * self.mm_image_weight)))
@@ -73,7 +91,7 @@ class PGL(GeneralRecommender):
 
     def sparse_mx_to_torch_sparse_tensor(self, sparse_mx):
         """Convert a scipy sparse matrix to a torch sparse tensor."""
-        sparse_mx = sparse_mx.tocoo().astype(np.float32)
+        sparse_mx = sparse_mx.tocoo().astype(np.float64)
         indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
@@ -93,6 +111,40 @@ class PGL(GeneralRecommender):
         # norm
         return indices, self.compute_normalized_laplacian(indices, adj_size)
 
+    # def post_epoch_processing(self):
+    #     predefined_epoch = self.predefined_epoch if hasattr(self, 'predefined_epoch') and self.predefined_epoch else 20
+    #     if self.current_epoch % predefined_epoch == 0 and self.current_epoch != 0:
+    #         with torch.no_grad():
+    #             if self.v_feat is not None:
+    #                 image_feats = self.image_trs(self.image_embedding.weight)
+    #             if self.t_feat is not None:
+    #                 text_feats = self.text_trs(self.text_embedding.weight)
+
+    #             image_feats, text_feats = F.normalize(image_feats), F.normalize(text_feats)
+    #             user_embeds = torch.cat([self.user_image.weight, self.user_text.weight], dim=1)
+    #             item_embeds = torch.cat([image_feats, text_feats], dim=1)
+
+    #             h = item_embeds
+    #             for i in range(self.n_layers):
+    #                 h = torch.sparse.mm(self.mm_adj.to(self.device), h)
+
+    #             ego_embeddings = torch.cat((user_embeds, item_embeds), dim=0)
+    #             all_embeddings = [ego_embeddings]
+    #             for i in range(self.n_ui_layers):
+    #                 side_embeddings = torch.sparse.mm(self.norm_adj, ego_embeddings)
+    #                 ego_embeddings = side_embeddings
+    #                 all_embeddings += [ego_embeddings]
+    #             all_embeddings = torch.stack(all_embeddings, dim=1)
+    #             all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
+    #             u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
+
+    #             torch.save(h.cpu(), f'pgl_h_embeddings_epoch_{self.current_epoch}.pt')
+    #             torch.save(u_g_embeddings.cpu(), f'pgl_u_g_embeddings_epoch_{self.current_epoch}.pt')
+    #             torch.save(i_g_embeddings.cpu(), f'pgl_i_g_embeddings_epoch_{self.current_epoch}.pt')
+    #             print(f"============================================================")
+    #             print(f"PGL Embeddings saved at epoch {self.current_epoch} to working directory.")
+    #             print(f"============================================================")
+
     def compute_normalized_laplacian(self, indices, adj_size):
         adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
         row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
@@ -104,14 +156,14 @@ class PGL(GeneralRecommender):
 
     def get_norm_adj_mat(self):
         A = sp.dok_matrix((self.n_users + self.n_items,
-                           self.n_users + self.n_items), dtype=np.float32)
+                           self.n_users + self.n_items), dtype=np.float64)
         inter_M = self.interaction_matrix
         inter_M_t = self.interaction_matrix.transpose()
         data_dict = dict(zip(zip(inter_M.row, inter_M.col + self.n_users),
                              [1] * inter_M.nnz))
         data_dict.update(dict(zip(zip(inter_M_t.row + self.n_users, inter_M_t.col),
                                   [1] * inter_M_t.nnz)))
-        A._update(data_dict)
+        A.update(data_dict)
         # norm adj matrix
         sumArr = (A > 0).sum(axis=1)
         # add epsilon to avoid Devide by zero Warning
@@ -133,7 +185,9 @@ class PGL(GeneralRecommender):
 
     def global_subgraph_extraction(self, adj):
         norm_adj = adj.tocsc()
-        ut, s, vt = sparsesvd(norm_adj, self.embedding_dim)
+        # ut, s, vt = sparsesvd(norm_adj, self.embedding_dim)
+        ut, s, vt = svds(norm_adj, self.embedding_dim)
+
 
         # Get the top and bottom 25% of singular values
         num_top_bottom = int(0.25 * self.embedding_dim)
@@ -162,6 +216,12 @@ class PGL(GeneralRecommender):
         pass
 
     def pre_epoch_processing(self):
+
+        if not hasattr(self, 'current_epoch'):
+            self.current_epoch = 0
+        else:
+            self.current_epoch += 1
+
         if self.mode == 'local':
             # degree-sensitive edge pruning
             degree_len = int(self.edge_values.size(0) * 0.3)
@@ -207,7 +267,7 @@ class PGL(GeneralRecommender):
 
         h = item_embeds
         for i in range(self.n_layers):
-            h = torch.sparse.mm(self.mm_adj, h)
+            h = torch.sparse.mm(self.mm_adj.to(self.device), h)
 
         ego_embeddings = torch.cat((user_embeds, item_embeds), dim=0)
         all_embeddings = [ego_embeddings]
@@ -218,7 +278,29 @@ class PGL(GeneralRecommender):
         all_embeddings = torch.stack(all_embeddings, dim=1)
         all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
         u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
+        
+        # gate = torch.sigmoid(self.degree_gate(torch.log1p(self.item_degrees)))
+        # sim_u_i = F.cosine_similarity(u_g_embeddings, i_g_embeddings, dim=-1)
+        # sim_u_m = F.cosine_similarity(u_g_embeddings, h, dim=-1)
+
+        # final_i_embeddings =  sim_u_i * i_g_embeddings + (1 - gate) * h
+        # return u_g_embeddings, final_i_embeddings
         return u_g_embeddings, i_g_embeddings + h
+
+        # h = self.item_id_embedding.weight
+        # for i in range(self.n_layers):
+        #     h = torch.sparse.mm(self.mm_adj.to(self.device), h)
+
+        # ego_embeddings = torch.cat((self.user_embedding.weight, self.item_id_embedding.weight), dim=0)
+        # all_embeddings = [ego_embeddings]
+        # for i in range(self.n_ui_layers):
+        #     side_embeddings = torch.sparse.mm(adj, ego_embeddings)
+        #     ego_embeddings = side_embeddings
+        #     all_embeddings += [ego_embeddings]
+        # all_embeddings = torch.stack(all_embeddings, dim=1)
+        # all_embeddings = all_embeddings.mean(dim=1, keepdim=False)
+        # u_g_embeddings, i_g_embeddings = torch.split(all_embeddings, [self.n_users, self.n_items], dim=0)
+        # return u_g_embeddings, i_g_embeddings + h
 
     def bpr_loss(self, users, pos_items, neg_items):
         pos_scores = torch.sum(torch.mul(users, pos_items), dim=1)
@@ -238,21 +320,31 @@ class PGL(GeneralRecommender):
         cl_loss = -torch.log(pos_score / ttl_score)
         return torch.mean(cl_loss)
 
-    def calculate_loss(self, interaction):
+    def calculate_loss(self, interaction): 
         users = interaction[0]
         pos_items = interaction[1]
         neg_items = interaction[2]
 
-        ua_embeddings, ia_embeddings = self.forward(self.sub_graph)
+        ua_embeddings, ia_embeddings= self.forward(self.sub_graph)
 
         u_g_embeddings = ua_embeddings[users]
+
+        
+
         pos_i_g_embeddings = ia_embeddings[pos_items]
         neg_i_g_embeddings = ia_embeddings[neg_items]
 
         batch_mf_loss = self.bpr_loss(u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings)
         cl_loss = (self.InfoNCE(self.dropoutf(u_g_embeddings), self.dropoutf(u_g_embeddings), 0.2)
                    + self.InfoNCE(self.dropoutf(pos_i_g_embeddings), self.dropoutf(pos_i_g_embeddings), 0.2)) / 2
+
+        # cl_loss = (self.InfoNCE(u_g_embeddings, u_g_embeddings, 0.2)
+        #            + self.InfoNCE(pos_i_g_embeddings, pos_i_g_embeddings, 0.2)) / 2
+
+        # cl_loss = self.InfoNCE(u_g_embeddings, u_g_embeddings, 0.2)
         return batch_mf_loss + self.reg_weight * cl_loss
+        # return batch_mf_loss
+
 
     def full_sort_predict(self, interaction):
         user = interaction[0]
