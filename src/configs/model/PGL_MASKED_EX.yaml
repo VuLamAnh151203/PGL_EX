@@ -34,7 +34,7 @@ hard_mask_temperature: 1.0
 # prior_residual: score = residual_logit + lambda_sem * q_sem
 # bounded_residual: score = q_sem + lambda_r * tanh(residual_logit / T)
 semantic_mask_variant: bounded_residual
-lambda_sem: 2.0
+lambda_sem: 1.0
 # Used by bounded_residual. To sweep, use [0.1, 0.25, 0.5, 1.0] here and
 # set hyper_parameters to [lambda_r] below.
 lambda_r: 0.25
