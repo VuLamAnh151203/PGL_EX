@@ -24,7 +24,7 @@ mask_degree_mode: full
 # soft: weighted full graph; hard: retain mask_keep_ratio edges;
 # double_full: no mask, both branches use the complete U-I graph.
 # mask_graph_mode: double_full
-mask_graph_mode: double_full
+mask_graph_mode: hard
 # shared: both branches share user tables; separate: one table pair per branch.
 user_embedding_mode: separate
 # dual: full + second branch; masked_only: only the second branch;
