@@ -18,13 +18,18 @@ from models.pgl_masked import PGL_MASKED, _config_value
 class PGL_MASKED_EX(PGL_MASKED):
     """Semantic-prior extension of :class:`PGL_MASKED`.
 
-    Supported variants are ``semantic_only`` and ``prior_residual``.  The
-    semantic affinities are computed once from the original pretrained item
-    features.  They are buffers rather than parameters, so the mask cannot
-    change the features from which its prior was derived.
+    Supported variants are ``semantic_only``, ``prior_residual`` and
+    ``bounded_residual``.  The semantic affinities are computed once from the
+    original pretrained item features.  They are buffers rather than
+    parameters, so the mask cannot change the features from which its prior
+    was derived.
     """
 
-    _SEMANTIC_VARIANTS = {'semantic_only', 'prior_residual'}
+    _SEMANTIC_VARIANTS = {
+        'semantic_only',
+        'prior_residual',
+        'bounded_residual',
+    }
     _AFFINITY_CHUNK_SIZE = 2048
 
     def __init__(self, config, dataset):
@@ -36,6 +41,10 @@ class PGL_MASKED_EX(PGL_MASKED):
             )
         ).lower()
         self.lambda_sem = float(_config_value(config, 'lambda_sem', 1.0))
+        self.lambda_r = float(_config_value(config, 'lambda_r', 0.25))
+        self.residual_temperature = float(
+            _config_value(config, 'residual_temperature', 1.0)
+        )
 
         if self.ui_branch_mode != 'dual':
             raise ValueError(
@@ -49,15 +58,31 @@ class PGL_MASKED_EX(PGL_MASKED):
             )
         if self.semantic_mask_variant not in self._SEMANTIC_VARIANTS:
             raise ValueError(
-                "semantic_mask_variant must be 'semantic_only' or "
-                "'prior_residual'."
+                "semantic_mask_variant must be 'semantic_only', "
+                "'prior_residual', or 'bounded_residual'."
             )
         if not math.isfinite(self.lambda_sem) or self.lambda_sem < 0.0:
             raise ValueError('lambda_sem must be a finite non-negative value.')
+        if not math.isfinite(self.lambda_r) or self.lambda_r < 0.0:
+            raise ValueError('lambda_r must be a finite non-negative value.')
+        if (
+            not math.isfinite(self.residual_temperature)
+            or self.residual_temperature <= 0.0
+        ):
+            raise ValueError(
+                'residual_temperature must be a finite positive value.'
+            )
         if self.mask_logits is None:
             raise RuntimeError(
                 'PGL_MASKED_EX requires residual mask_logits to be present.'
             )
+
+        # In bounded-residual mode r_ui is a correction around the semantic
+        # base, so start from score_ui = q_sem rather than inheriting the
+        # logit(mask_keep_ratio) initialization used by the original mask.
+        if self.semantic_mask_variant == 'bounded_residual':
+            with torch.no_grad():
+                self.mask_logits.zero_()
 
         # Equal visual/text contribution at initialization.  Softmax keeps
         # both learned weights non-negative and summing to one.
@@ -189,10 +214,15 @@ class PGL_MASKED_EX(PGL_MASKED):
 
     def effective_mask_logits(self):
         """Return the score actually used to weight or select U-I edges."""
-        semantic_component = self.lambda_sem * self.semantic_prior()
+        prior = self.semantic_prior()
         if self.semantic_mask_variant == 'semantic_only':
-            return semantic_component
-        return self.mask_logits + semantic_component
+            return self.lambda_sem * prior
+        if self.semantic_mask_variant == 'bounded_residual':
+            correction = self.lambda_r * torch.tanh(
+                self.mask_logits / self.residual_temperature
+            )
+            return prior + correction
+        return self.mask_logits + self.lambda_sem * prior
 
     @property
     def hard_keep_count(self):
@@ -273,6 +303,9 @@ class PGL_MASKED_EX(PGL_MASKED):
         selected[topk_indices] = True
         alpha = self.semantic_weights()
         prior = self.semantic_prior()
+        bounded_correction = self.lambda_r * torch.tanh(
+            self.mask_logits / self.residual_temperature
+        )
 
         artifacts['masks']['masked_branch'] = {
             # Existing notebook-facing fields describe the actual selection
@@ -292,12 +325,19 @@ class PGL_MASKED_EX(PGL_MASKED):
             'semantic_alpha_visual': alpha[0].detach().cpu(),
             'semantic_alpha_textual': alpha[1].detach().cpu(),
             'lambda_sem': self.lambda_sem,
+            'lambda_r': self.lambda_r,
+            'residual_temperature': self.residual_temperature,
+            'bounded_residual_correction': (
+                bounded_correction.detach().cpu()
+            ),
             'semantic_mask_variant': self.semantic_mask_variant,
         }
         artifacts['metadata'].update({
             'semantic_mask_variant': self.semantic_mask_variant,
             'semantic_feature_source': 'fixed_original_pretrained',
             'lambda_sem': self.lambda_sem,
+            'lambda_r': self.lambda_r,
+            'residual_temperature': self.residual_temperature,
             'semantic_alpha_visual': float(alpha[0].item()),
             'semantic_alpha_textual': float(alpha[1].item()),
         })

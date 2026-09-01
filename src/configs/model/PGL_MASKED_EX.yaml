@@ -16,7 +16,7 @@ mm_image_weight: 0.1
 cl_weight: 0.05
 cl_temperature: 0.2
 dropout: 0.2
-mask_weight: 0.0
+mask_weight: 0.1
 
 mask_keep_ratio: 0.3
 mask_binary_weight: 0.1
@@ -32,8 +32,13 @@ hard_mask_temperature: 1.0
 
 # semantic_only: score = lambda_sem * q_sem
 # prior_residual: score = residual_logit + lambda_sem * q_sem
-semantic_mask_variant: prior_residual
+# bounded_residual: score = q_sem + lambda_r * tanh(residual_logit / T)
+semantic_mask_variant: bounded_residual
 lambda_sem: 2.0
+# Used by bounded_residual. To sweep, use [0.1, 0.25, 0.5, 1.0] here and
+# set hyper_parameters to [lambda_r] below.
+lambda_r: 0.25
+residual_temperature: 1.0
 
 # Save the best-validation mask decomposition, embeddings and representations.
 save_analysis_artifacts: True

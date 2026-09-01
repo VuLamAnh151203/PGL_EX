@@ -64,6 +64,8 @@ def make_score_model(
     textual=(0.6, -0.2, 0.3),
     variant='prior_residual',
     lambda_sem=2.0,
+    lambda_r=0.25,
+    residual_temperature=1.0,
     keep_ratio=0.3,
 ):
     """Build the mask-specific part of the model without dataset I/O."""
@@ -71,6 +73,8 @@ def make_score_model(
     nn.Module.__init__(model)
     model.semantic_mask_variant = variant
     model.lambda_sem = lambda_sem
+    model.lambda_r = lambda_r
+    model.residual_temperature = residual_temperature
     model.semantic_gamma = nn.Parameter(torch.zeros(2))
     model.mask_logits = nn.Parameter(torch.tensor(residual, dtype=torch.float32))
     model.register_buffer(
@@ -161,6 +165,26 @@ class SemanticScoreTest(unittest.TestCase):
         torch.testing.assert_close(
             model.effective_mask_logits(), model.mask_logits
         )
+
+    def test_bounded_residual_formula_bound_and_gradients(self):
+        model = make_score_model(
+            residual=(0.0, 0.25, -0.25),
+            variant='bounded_residual',
+            lambda_r=0.25,
+            residual_temperature=0.5,
+        )
+        prior = model.semantic_prior()
+        correction = model.effective_mask_logits() - prior
+        expected_correction = 0.25 * torch.tanh(
+            torch.tensor([0.0, 0.5, -0.5])
+        )
+
+        torch.testing.assert_close(correction, expected_correction)
+        self.assertLessEqual(correction.abs().max().item(), 0.25)
+        model.effective_mask_logits().sum().backward()
+        self.assertIsNotNone(model.mask_logits.grad)
+        self.assertTrue(torch.isfinite(model.mask_logits.grad).all())
+        self.assertIsNotNone(model.semantic_gamma.grad)
 
     def test_hard_eval_uses_effective_score_and_floor_keep_count(self):
         model = make_score_model(
@@ -255,6 +279,8 @@ class ModelIntegrationTest(unittest.TestCase):
             'ui_branch_mode': 'dual',
             'semantic_mask_variant': variant,
             'lambda_sem': 1.0,
+            'lambda_r': 0.25,
+            'residual_temperature': 1.0,
             'cl_weight': 0.05,
             'cl_temperature': 0.2,
             'dropout': 0.0,
@@ -311,6 +337,9 @@ class ModelIntegrationTest(unittest.TestCase):
             )
             self.assertIn('residual_mask_logits', mask_artifact)
             self.assertIn('semantic_prior', mask_artifact)
+            self.assertIn('bounded_residual_correction', mask_artifact)
+            self.assertEqual(mask_artifact['lambda_r'], 0.25)
+            self.assertEqual(mask_artifact['residual_temperature'], 1.0)
 
             restored = TestablePGLMaskedEx(config, train_data)
             restored.load_state_dict(model.state_dict())
@@ -340,6 +369,24 @@ class ModelIntegrationTest(unittest.TestCase):
             self.assertFalse(model.mask_logits.requires_grad)
             self.assertTrue(torch.isfinite(users).all())
             self.assertTrue(torch.isfinite(items).all())
+
+    def test_bounded_residual_starts_from_semantic_prior(self):
+        with tempfile.TemporaryDirectory() as temporary_root:
+            self.write_features(temporary_root)
+            config = self.make_config(
+                temporary_root,
+                graph_mode='hard',
+                variant='bounded_residual',
+            )
+            model = TestablePGLMaskedEx(config, FakeTrainData())
+
+            torch.testing.assert_close(
+                model.mask_logits,
+                torch.zeros_like(model.mask_logits),
+            )
+            torch.testing.assert_close(
+                model.effective_mask_logits(), model.semantic_prior()
+            )
 
 
 if __name__ == '__main__':
