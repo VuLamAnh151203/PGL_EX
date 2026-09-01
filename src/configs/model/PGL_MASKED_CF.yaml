@@ -48,7 +48,7 @@ cf_block_kmeans_tolerance: 0.0001
 # theta_e + lambda_s * q_sem(e) + lambda_c * stop_grad(g_phi(B(e))).
 # Keep lambda_s=0 for the default theta + causal-correction experiment.
 lambda_s: 0.0
-lambda_c: 1.0
+lambda_c: 2.0
 lambda_cf: 0.5
 cf_samples_per_batch: 2
 cf_warmup_epochs: 5
