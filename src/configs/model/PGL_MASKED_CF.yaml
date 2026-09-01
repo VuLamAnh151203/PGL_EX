@@ -51,7 +51,7 @@ lambda_s: 0.0
 lambda_c: 1.0
 lambda_cf: 0.5
 cf_samples_per_batch: 2
-cf_warmup_epochs: 10
+cf_warmup_epochs: 5
 cf_hidden_dim: 32
 cf_huber_beta: 0.1
 cf_rank_temperature: 0.2
