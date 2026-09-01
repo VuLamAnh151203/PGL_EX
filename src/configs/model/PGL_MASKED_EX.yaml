@@ -33,7 +33,7 @@ hard_mask_temperature: 1.0
 # semantic_only: score = lambda_sem * q_sem
 # prior_residual: score = residual_logit + lambda_sem * q_sem
 semantic_mask_variant: prior_residual
-lambda_sem: 1.0
+lambda_sem: 2.0
 
 # Save the best-validation mask decomposition, embeddings and representations.
 save_analysis_artifacts: True
