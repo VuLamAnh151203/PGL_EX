@@ -24,15 +24,30 @@ user_embedding_mode: separate
 ui_branch_mode: dual
 hard_mask_temperature: 1.0
 
-# Parent initialization only. PGL_MASKED_CF replaces the per-edge residual
-# with score = q_sem + lambda_c * g_phi(edge).
-semantic_mask_variant: semantic_only
-lambda_sem: 1.0
+# Parent initialization only. PGL_MASKED_CF defines its own effective score.
+semantic_mask_variant: prior_residual
+lambda_sem: 0.0
 
-# Counterfactual synergy supervision.
+# Counterfactual supervision.
 # synergy:      (O_F+M^+ - O_F+M^-) - (O_M^+ - O_M^-)
 # fused_effect:  O_F+M^+ - O_F+M^-
+cf_intervention_mode: semantic_block
 cf_target_mode: fused_effect
+
+# Global semantic blocks and Full-hard multi-query outcome.
+cf_block_num_prototypes: 8
+cf_block_visual_weight: 0.5
+cf_block_min_edges: 2
+cf_block_queries_per_target: 10
+cf_block_full_temperature: 1.0
+cf_block_kmeans_seed: 999
+cf_block_kmeans_iterations: 25
+cf_block_kmeans_tolerance: 0.0001
+
+# Final edge score:
+# theta_e + lambda_s * q_sem(e) + lambda_c * stop_grad(g_phi(B(e))).
+# Keep lambda_s=0 for the default theta + causal-correction experiment.
+lambda_s: 0.0
 lambda_c: 1.0
 lambda_cf: 0.1
 cf_samples_per_batch: 2

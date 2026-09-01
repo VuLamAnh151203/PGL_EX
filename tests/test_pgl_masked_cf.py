@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 
 
 SRC_DIR = Path(__file__).resolve().parents[1] / 'src'
@@ -48,6 +49,21 @@ class FakeTrainData:
         return self._interactions.asformat(form)
 
 
+class FakeBlockTrainData(FakeTrainData):
+    def __init__(self):
+        self.dataset = FakeDatasetStats()
+        self._interactions = sp.coo_matrix(
+            (
+                np.ones(7, dtype=np.float32),
+                (
+                    np.array([0, 0, 0, 1, 2, 2, 2]),
+                    np.array([0, 1, 2, 2, 0, 1, 3]),
+                ),
+            ),
+            shape=(3, 4),
+        )
+
+
 class TestablePGLMaskedCF(PGL_MASKED_CF):
     def _build_or_load_mm_graph(self, config):
         indices = torch.arange(self.n_items).repeat(2, 1)
@@ -83,12 +99,17 @@ class PGLMaskedCFTest(unittest.TestCase):
             ], dtype=np.float32),
         )
         self.train_data = FakeTrainData()
+        self.block_train_data = FakeBlockTrainData()
 
     def tearDown(self):
         self.temporary_directory.cleanup()
 
     def config(
-        self, warmup=10, lambda_cf=0.1, target_mode='synergy'
+        self,
+        warmup=10,
+        lambda_cf=0.1,
+        target_mode='synergy',
+        intervention_mode='edge',
     ):
         return NullableConfig({
             'USER_ID_FIELD': 'user_id',
@@ -113,8 +134,9 @@ class PGLMaskedCFTest(unittest.TestCase):
             'user_embedding_mode': 'separate',
             'ui_branch_mode': 'dual',
             'hard_mask_temperature': 1.0,
-            'semantic_mask_variant': 'semantic_only',
-            'lambda_sem': 1.0,
+            'semantic_mask_variant': 'prior_residual',
+            'lambda_sem': 0.0,
+            'lambda_s': 0.0,
             'lambda_c': 1.0,
             'lambda_cf': lambda_cf,
             'cf_samples_per_batch': 2,
@@ -124,6 +146,15 @@ class PGLMaskedCFTest(unittest.TestCase):
             'cf_rank_temperature': 0.2,
             'cf_min_tau_gap': 1e-6,
             'cf_target_mode': target_mode,
+            'cf_intervention_mode': intervention_mode,
+            'cf_block_num_prototypes': 2,
+            'cf_block_visual_weight': 0.5,
+            'cf_block_min_edges': 2,
+            'cf_block_queries_per_target': 3,
+            'cf_block_full_temperature': 1.0,
+            'cf_block_kmeans_seed': 999,
+            'cf_block_kmeans_iterations': 25,
+            'cf_block_kmeans_tolerance': 1e-4,
             'cl_weight': 0.05,
             'cl_temperature': 0.2,
             'dropout': 0.0,
@@ -141,30 +172,51 @@ class PGLMaskedCFTest(unittest.TestCase):
         )
 
     def model(
-        self, warmup=10, lambda_cf=0.1, target_mode='synergy'
+        self,
+        warmup=10,
+        lambda_cf=0.1,
+        target_mode='synergy',
+        intervention_mode='edge',
     ):
+        train_data = (
+            self.block_train_data
+            if intervention_mode == 'semantic_block'
+            else self.train_data
+        )
         return TestablePGLMaskedCF(
             self.config(
                 warmup=warmup,
                 lambda_cf=lambda_cf,
                 target_mode=target_mode,
+                intervention_mode=intervention_mode,
             ),
-            self.train_data,
+            train_data,
         )
 
-    def test_loader_initial_score_features_and_frozen_residual(self):
+    def block_model(self, warmup=0, lambda_cf=0.1):
+        return self.model(
+            warmup=warmup,
+            lambda_cf=lambda_cf,
+            target_mode='fused_effect',
+            intervention_mode='semantic_block',
+        )
+
+    def test_loader_initial_score_features_and_learnable_residual(self):
         self.assertIs(get_model('PGL_MASKED_CF'), PGL_MASKED_CF)
         model = self.model()
 
-        torch.testing.assert_close(
-            model.mask_logits, torch.zeros_like(model.mask_logits)
-        )
-        self.assertFalse(model.mask_logits.requires_grad)
+        self.assertTrue(model.mask_logits.requires_grad)
         torch.testing.assert_close(
             model.causal_score(), torch.zeros(model.num_interactions)
         )
         torch.testing.assert_close(
-            model.effective_mask_logits(), model.semantic_prior()
+            model.effective_mask_logits(), model.mask_logits
+        )
+
+        model.lambda_s = 0.5
+        torch.testing.assert_close(
+            model.effective_mask_logits(),
+            model.mask_logits + 0.5 * model.semantic_prior(),
         )
 
         features = model.causal_edge_features()
@@ -302,6 +354,8 @@ class PGLMaskedCFTest(unittest.TestCase):
 
         for parameter in model.causal_scorer.parameters():
             self.assertIsNone(parameter.grad)
+        self.assertIsNotNone(model.mask_logits.grad)
+        self.assertTrue(torch.isfinite(model.mask_logits.grad).all())
 
     def test_causal_losses_update_scorer_and_skip_tied_rank(self):
         model = self.model(warmup=0)
@@ -315,6 +369,8 @@ class PGLMaskedCFTest(unittest.TestCase):
         self.assertTrue(
             torch.isfinite(model.causal_scorer[2].weight.grad).all()
         )
+        self.assertIsNone(model.mask_logits.grad)
+        self.assertIsNone(model.semantic_gamma.grad)
 
         model.zero_grad(set_to_none=True)
         _, tied_rank, _ = model._causal_alignment_loss(
@@ -349,6 +405,247 @@ class PGLMaskedCFTest(unittest.TestCase):
         self.assertEqual(
             model.observed_tau_syn_count.sum().item(), 2
         )
+
+    def test_semantic_block_prototypes_and_membership_are_deterministic(self):
+        first = self.block_model()
+        second = self.block_model()
+        torch.testing.assert_close(
+            first.item_prototype_ids, second.item_prototype_ids
+        )
+        self.assertTrue((first.item_prototype_ids >= 0).all())
+        self.assertTrue((first.item_prototype_ids < 2).all())
+        self.assertEqual(first.edge_block_ids.numel(), 7)
+        self.assertEqual(
+            torch.unique(first.edge_block_ids).numel(),
+            first.num_semantic_blocks,
+        )
+
+        edge_users = first.ui_edge_index[0, :first.num_interactions]
+        edge_items = (
+            first.ui_edge_index[1, :first.num_interactions]
+            - first.n_users
+        )
+        expected_keys = (
+            edge_users * first.cf_block_num_prototypes
+            + first.item_prototype_ids[edge_items]
+        )
+        for block_id in range(first.num_semantic_blocks):
+            member_edges = torch.nonzero(
+                first.edge_block_ids == block_id, as_tuple=False
+            ).flatten()
+            self.assertEqual(
+                torch.unique(expected_keys[member_edges]).numel(), 1
+            )
+
+        zero_features = PGL_MASKED_CF._semantic_item_features(
+            torch.zeros(4, 3), torch.zeros(4, 2), 0.5
+        )
+        assignments = PGL_MASKED_CF._spherical_kmeans(
+            zero_features, 2, 7, 3, 1e-4
+        )
+        self.assertTrue(torch.isfinite(zero_features).all())
+        self.assertEqual(tuple(assignments.shape), (4,))
+
+    def test_semantic_block_sampling_queries_and_forced_graph(self):
+        model = self.block_model()
+        model.pre_epoch_processing()
+        users = torch.tensor([0, 1, 2])
+        dummy = torch.zeros_like(users)
+        block_ids, sampled_users, positives, negatives = (
+            model._sample_counterfactual_candidates(
+                users, dummy, dummy
+            )
+        )
+        self.assertEqual(block_ids.numel(), 2)
+        self.assertEqual(torch.unique(block_ids).numel(), 2)
+        self.assertEqual(tuple(positives.shape), (2, 3))
+        self.assertEqual(tuple(negatives.shape), (2, 3))
+
+        forward_items = (
+            model.ui_edge_index[1, :model.num_interactions]
+            - model.n_users
+        )
+        for block_id, user, positive_row, negative_row in zip(
+            block_ids, sampled_users, positives, negatives
+        ):
+            start = int(model.block_edge_ptr[block_id].item())
+            stop = int(model.block_edge_ptr[block_id + 1].item())
+            block_edges = model.block_edge_ids[start:stop]
+            block_items = forward_items[block_edges]
+            history_start = int(model.user_edge_ptr[user].item())
+            history_stop = int(model.user_edge_ptr[user + 1].item())
+            history_edges = model.user_edge_ids[
+                history_start:history_stop
+            ]
+            history_items = forward_items[history_edges]
+            self.assertTrue(torch.isin(positive_row, history_items).all())
+            self.assertFalse(torch.isin(negative_row, history_items).any())
+
+            excluded_edges = model._block_query_excluded_edge_ids(
+                block_id, positive_row
+            )
+            for excluded_edge in excluded_edges[excluded_edges >= 0]:
+                model.hard_train_indices = torch.tensor([0, 2, 4])
+                plus_loo = model._forced_block_interaction_indices(
+                    block_id,
+                    keep=True,
+                    excluded_edge_id=excluded_edge,
+                )
+                minus_loo = model._forced_block_interaction_indices(
+                    block_id,
+                    keep=False,
+                    excluded_edge_id=excluded_edge,
+                )
+                was_selected = torch.isin(
+                    excluded_edge, model.hard_train_indices
+                )
+                self.assertEqual(
+                    bool(torch.isin(excluded_edge, plus_loo)),
+                    bool(was_selected),
+                )
+                self.assertEqual(
+                    bool(torch.isin(excluded_edge, minus_loo)),
+                    bool(was_selected),
+                )
+
+            model.hard_train_indices = torch.tensor([0, 2, 4])
+            plus = model._forced_block_interaction_indices(
+                block_id, keep=True
+            )
+            minus = model._forced_block_interaction_indices(
+                block_id, keep=False
+            )
+            self.assertTrue(torch.isin(block_edges, plus).all())
+            self.assertFalse(torch.isin(block_edges, minus).any())
+            outside_base = model.hard_train_indices[
+                ~torch.isin(model.hard_train_indices, block_edges)
+            ]
+            self.assertTrue(torch.isin(outside_base, plus).all())
+            self.assertTrue(torch.isin(outside_base, minus).all())
+
+    def test_semantic_block_features_scores_and_weighted_target(self):
+        model = self.block_model()
+        edge_features = model.causal_edge_features()
+        block_features = model.causal_block_features()
+        for block_id in range(model.num_semantic_blocks):
+            members = torch.nonzero(
+                model.edge_block_ids == block_id, as_tuple=False
+            ).flatten()
+            torch.testing.assert_close(
+                block_features[block_id], edge_features[members].mean(0)
+            )
+
+        with torch.no_grad():
+            model.causal_scorer[2].weight.fill_(0.25)
+        block_scores = model.block_causal_score()
+        edge_scores = model.causal_score()
+        torch.testing.assert_close(
+            edge_scores, block_scores[model.edge_block_ids]
+        )
+
+        full = torch.tensor([-1.0, 0.0, 1.0])
+        plus = torch.tensor([0.3, 0.2, 0.1])
+        minus = torch.tensor([0.0, 0.0, 0.0])
+        actual = model._weighted_block_effect(full, plus, minus, 1.0)
+        weights = torch.sigmoid(-full)
+        expected = (
+            weights * (F.logsigmoid(plus) - F.logsigmoid(minus))
+        ).sum() / weights.sum()
+        torch.testing.assert_close(actual, expected)
+
+        base = torch.tensor([0.1, 0.1, 0.05])
+        total, add, remove = model._weighted_block_effect_components(
+            full, plus, base, minus, 1.0
+        )
+        expected_add = (
+            weights * (F.logsigmoid(plus) - F.logsigmoid(base))
+        ).sum() / weights.sum()
+        expected_remove = (
+            weights * (F.logsigmoid(base) - F.logsigmoid(minus))
+        ).sum() / weights.sum()
+        torch.testing.assert_close(add, expected_add)
+        torch.testing.assert_close(remove, expected_remove)
+        torch.testing.assert_close(total, add + remove)
+        torch.testing.assert_close(total, actual)
+
+    def test_semantic_block_training_artifacts_and_checkpoint(self):
+        model = self.block_model()
+        model.train()
+        model.pre_epoch_processing()
+        loss = model.calculate_loss(self.interaction())
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertGreaterEqual(model._last_cf_propagation_count, 4)
+        self.assertLessEqual(model._last_cf_propagation_count, 12)
+        self.assertEqual(model._last_cf_propagation_count % 2, 0)
+        self.assertEqual(
+            model.observed_block_target_count.sum().item(), 2
+        )
+        self.assertEqual(
+            model.observed_block_query_count.sum().item(), 6
+        )
+        torch.testing.assert_close(
+            model.observed_block_target_sum,
+            model.observed_block_add_effect_sum
+            + model.observed_block_remove_effect_sum,
+        )
+        self.assertIsNotNone(model.causal_scorer[2].weight.grad)
+
+        model.post_epoch_processing()
+        artifacts = model.get_analysis_artifacts()
+        blocks = artifacts['counterfactual_blocks']
+        self.assertEqual(
+            blocks['block_features'].shape,
+            (model.num_semantic_blocks, 6),
+        )
+        self.assertIn('observed_target_mean', blocks)
+        self.assertIn('observed_add_effect_mean', blocks)
+        self.assertIn('observed_remove_effect_mean', blocks)
+        self.assertIn('observed_query_count', blocks)
+        self.assertEqual(
+            artifacts['metadata']['cf_intervention_mode'],
+            'semantic_block',
+        )
+
+        restored = self.block_model()
+        restored.load_state_dict(model.state_dict())
+        torch.testing.assert_close(
+            restored.item_prototype_ids, model.item_prototype_ids
+        )
+        torch.testing.assert_close(
+            restored.edge_block_ids, model.edge_block_ids
+        )
+        torch.testing.assert_close(
+            restored.observed_block_target_sum,
+            model.observed_block_target_sum,
+        )
+        torch.testing.assert_close(
+            restored.observed_block_add_effect_sum,
+            model.observed_block_add_effect_sum,
+        )
+        torch.testing.assert_close(
+            restored.observed_block_remove_effect_sum,
+            model.observed_block_remove_effect_sum,
+        )
+
+    def test_semantic_block_bpr_path_detaches_block_scorer(self):
+        model = self.block_model(warmup=100, lambda_cf=0.0)
+        model.train()
+        model.pre_epoch_processing()
+        loss = model.calculate_loss(self.interaction())
+        loss.backward()
+        for parameter in model.causal_scorer.parameters():
+            self.assertIsNone(parameter.grad)
+        self.assertIsNotNone(model.mask_logits.grad)
+
+    def test_semantic_block_rejects_synergy_target(self):
+        with self.assertRaisesRegex(
+            ValueError, 'requires cf_target_mode'
+        ):
+            self.model(
+                target_mode='synergy',
+                intervention_mode='semantic_block',
+            )
 
     def test_active_training_artifacts_and_checkpoint_round_trip(self):
         model = self.model(warmup=0)
