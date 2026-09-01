@@ -33,4 +33,9 @@ ui_branch_mode: dual
 # Controls stochastic Gumbel top-k exploration during training.
 hard_mask_temperature: 1.0
 
+# Save the best-validation masks, embedding tables, and branch outputs.
+save_analysis_artifacts: True
+# Leave the in-memory model at the best validation epoch after training.
+restore_best_model: True
+
 hyper_parameters: []

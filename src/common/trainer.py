@@ -87,6 +87,7 @@ class Trainer(AbstractTrainer):
         for j, k in list(itertools.product(config['metrics'], config['topk'])):
             tmp_dd[f'{j.lower()}@{k}'] = 0.0
         self.best_valid_score = -1
+        self.best_epoch = -1
         self.best_valid_result = tmp_dd
         self.best_test_upon_valid = tmp_dd
         self.train_loss_dict = dict()
@@ -107,6 +108,121 @@ class Trainer(AbstractTrainer):
         self.alpha1 = config['alpha1']
         self.alpha2 = config['alpha2']
         self.beta = config['beta']
+
+        checkpoint_dir = config['checkpoint_dir'] or 'saved'
+        run_name = '{}-{}-seed{}-{}'.format(
+            config['model'],
+            config['dataset'],
+            config['seed'],
+            get_local_time(),
+        )
+        self.checkpoint_dir = os.path.abspath(checkpoint_dir)
+        self.saved_model_file = os.path.join(
+            self.checkpoint_dir, run_name + '.pth'
+        )
+        self.analysis_file = os.path.join(
+            self.checkpoint_dir, run_name + '-analysis.pt'
+        )
+        self.save_analysis_artifacts = (
+            config['save_analysis_artifacts'] is True
+        )
+        self.restore_best_model = config['restore_best_model'] is not False
+
+    @staticmethod
+    def _serializable_config_value(value):
+        if isinstance(value, torch.device):
+            return str(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {
+                key: Trainer._serializable_config_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                Trainer._serializable_config_value(item) for item in value
+            ]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _checkpoint_config(self):
+        config_dict = getattr(self.config, 'final_config_dict', {})
+        return {
+            key: self._serializable_config_value(value)
+            for key, value in config_dict.items()
+        }
+
+    @staticmethod
+    def _atomic_torch_save(payload, file_path):
+        temporary_file = file_path + '.tmp'
+        torch.save(payload, temporary_file)
+        os.replace(temporary_file, file_path)
+
+    def _save_best_checkpoint(
+        self, epoch_idx, valid_result, test_result
+    ):
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        saved_valid_result = self._serializable_config_value(valid_result)
+        saved_test_result = self._serializable_config_value(test_result)
+        checkpoint = {
+            'epoch': epoch_idx,
+            'best_valid_score': float(self.best_valid_score),
+            'best_valid_result': saved_valid_result,
+            'test_result_upon_best_valid': saved_test_result,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
+            'config': self._checkpoint_config(),
+        }
+        self._atomic_torch_save(checkpoint, self.saved_model_file)
+        self.logger.info(
+            'Saved best model checkpoint to %s', self.saved_model_file
+        )
+
+        if not self.save_analysis_artifacts:
+            return
+
+        if hasattr(self.model, 'get_analysis_artifacts'):
+            analysis = self.model.get_analysis_artifacts()
+        else:
+            analysis = {
+                'learnable_parameters': {
+                    name: parameter.detach().cpu()
+                    for name, parameter in self.model.named_parameters()
+                    if parameter.requires_grad
+                }
+            }
+        analysis.update({
+            'epoch': epoch_idx,
+            'best_valid_score': float(self.best_valid_score),
+            'best_valid_result': saved_valid_result,
+            'test_result_upon_best_valid': saved_test_result,
+            'checkpoint_file': self.saved_model_file,
+            'config': self._checkpoint_config(),
+        })
+        self._atomic_torch_save(analysis, self.analysis_file)
+        self.logger.info(
+            'Saved mask/embedding analysis data to %s', self.analysis_file
+        )
+
+    def _restore_best_checkpoint(self):
+        try:
+            checkpoint = torch.load(
+                self.saved_model_file,
+                map_location=self.device,
+                weights_only=True,
+            )
+        except TypeError:
+            checkpoint = torch.load(
+                self.saved_model_file, map_location=self.device
+            )
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.post_epoch_processing()
+        self.logger.info(
+            'Restored best model from epoch %d', checkpoint['epoch']
+        )
 
     def _build_optimizer(self):
         r"""Init the Optimizer
@@ -279,6 +395,11 @@ class Trainer(AbstractTrainer):
                         self.logger.info(update_output)
                     self.best_valid_result = valid_result
                     self.best_test_upon_valid = test_result
+                    self.best_epoch = epoch_idx
+                    if saved:
+                        self._save_best_checkpoint(
+                            epoch_idx, valid_result, test_result
+                        )
 
                 if stop_flag:
                     stop_output = '+++++Finished training, best eval result in epoch %d' % \
@@ -286,6 +407,13 @@ class Trainer(AbstractTrainer):
                     if verbose:
                         self.logger.info(stop_output)
                     break
+        if (
+            saved
+            and self.restore_best_model
+            and self.best_epoch >= 0
+            and os.path.isfile(self.saved_model_file)
+        ):
+            self._restore_best_checkpoint()
         return self.best_valid_score, self.best_valid_result, self.best_test_upon_valid
 
 

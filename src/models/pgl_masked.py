@@ -235,16 +235,24 @@ class PGL_MASKED(GeneralRecommender):
         else:
             self.register_parameter('second_mask_logits', None)
         self.register_buffer(
-            'hard_train_indices', torch.empty(0, dtype=torch.long)
+            'hard_train_indices',
+            torch.empty(0, dtype=torch.long),
+            persistent=False,
         )
         self.register_buffer(
-            'hard_eval_indices', torch.empty(0, dtype=torch.long)
+            'hard_eval_indices',
+            torch.empty(0, dtype=torch.long),
+            persistent=False,
         )
         self.register_buffer(
-            'second_hard_train_indices', torch.empty(0, dtype=torch.long)
+            'second_hard_train_indices',
+            torch.empty(0, dtype=torch.long),
+            persistent=False,
         )
         self.register_buffer(
-            'second_hard_eval_indices', torch.empty(0, dtype=torch.long)
+            'second_hard_eval_indices',
+            torch.empty(0, dtype=torch.long),
+            persistent=False,
         )
 
         full_edge_weights = torch.ones(edge_index.size(1), dtype=torch.float32)
@@ -830,3 +838,79 @@ class PGL_MASKED(GeneralRecommender):
         return torch.matmul(
             batch_user_embeddings, item_embeddings.transpose(0, 1)
         )
+
+    @torch.no_grad()
+    def get_analysis_artifacts(self):
+        """Export masks and learned embeddings aligned with U-I edge IDs."""
+        was_training = self.training
+        self.eval()
+        representations = self._encode()
+
+        forward_edges = self.ui_edge_index[:, :self.num_interactions]
+        edge_users = forward_edges[0].detach().cpu()
+        edge_items = (
+            forward_edges[1] - self.n_users
+        ).detach().cpu()
+
+        masks = {}
+        mask_entries = []
+        if self.mask_logits is not None:
+            first_name = (
+                'visual_branch'
+                if self.ui_branch_mode == 'dual_modal'
+                else 'masked_branch'
+            )
+            mask_entries.append((first_name, self.mask_logits))
+        if self.second_mask_logits is not None:
+            mask_entries.append(('text_branch', self.second_mask_logits))
+
+        for branch_name, logits in mask_entries:
+            probabilities = torch.sigmoid(logits)
+            topk_indices = self._select_hard_eval_indices(logits)
+            topk_selected = torch.zeros_like(
+                probabilities, dtype=torch.bool
+            )
+            topk_selected[topk_indices] = True
+            masks[branch_name] = {
+                'logits': logits.detach().cpu(),
+                'probabilities': probabilities.detach().cpu(),
+                'selected_at_keep_ratio': topk_selected.detach().cpu(),
+            }
+
+        embedding_tables = {}
+        for module_name, module in self.named_modules():
+            if isinstance(module, nn.Embedding) and module.weight.requires_grad:
+                embedding_tables[module_name + '.weight'] = (
+                    module.weight.detach().cpu()
+                )
+
+        exported_representations = {
+            name: tensor.detach().cpu()
+            for name, tensor in representations.items()
+            if torch.is_tensor(tensor) and name not in {'mask', 'second_mask'}
+        }
+
+        artifacts = {
+            'metadata': {
+                'model': self.__class__.__name__,
+                'mask_graph_mode': self.mask_graph_mode,
+                'mask_degree_mode': self.mask_degree_mode,
+                'ui_branch_mode': self.ui_branch_mode,
+                'user_embedding_mode': self.user_embedding_mode,
+                'mask_keep_ratio': self.mask_keep_ratio,
+                'num_users': self.n_users,
+                'num_items': self.n_items,
+                'num_interactions': self.num_interactions,
+            },
+            'ui_edges': {
+                'user_ids': edge_users,
+                'item_ids': edge_items,
+            },
+            'masks': masks,
+            'embedding_tables': embedding_tables,
+            'representations': exported_representations,
+        }
+
+        if was_training:
+            self.train()
+        return artifacts
