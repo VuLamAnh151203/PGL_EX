@@ -52,6 +52,9 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
         self.cf_min_tau_gap = float(
             _config_value(config, 'cf_min_tau_gap', 1e-6)
         )
+        self.cf_target_mode = str(
+            _config_value(config, 'cf_target_mode', 'synergy')
+        ).lower()
 
         if self.ui_branch_mode != 'dual':
             raise ValueError(
@@ -179,6 +182,10 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
             raise ValueError('cf_warmup_epochs must be non-negative.')
         if self.cf_hidden_dim <= 0:
             raise ValueError('cf_hidden_dim must be positive.')
+        if self.cf_target_mode not in {'synergy', 'fused_effect'}:
+            raise ValueError(
+                "cf_target_mode must be 'synergy' or 'fused_effect'."
+            )
         if not math.isfinite(self.cf_huber_beta) or self.cf_huber_beta <= 0:
             raise ValueError('cf_huber_beta must be finite and positive.')
         if (
@@ -423,6 +430,9 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
             fused_user * fused_negative
         )
 
+        if self.cf_target_mode == 'fused_effect':
+            return fused_margin, None
+
         masked_user = selected_masked[0]
         masked_positive = selected_masked[1] + mm_items[positive_item]
         masked_negative = selected_masked[2] + mm_items[negative_item]
@@ -438,6 +448,28 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
         fused_effect = fused_plus - fused_minus
         masked_effect = masked_plus - masked_minus
         return fused_effect - masked_effect
+
+    def _counterfactual_target_from_outcomes(
+        self,
+        fused_plus,
+        fused_minus,
+        masked_plus,
+        masked_minus,
+    ):
+        """Return the configured intervention target.
+
+        ``fused_effect`` directly measures the keep/remove effect on the
+        deployed Full+Mask scoring path. ``synergy`` retains the original
+        difference-in-differences target by subtracting the Mask-only effect.
+        """
+        if self.cf_target_mode == 'fused_effect':
+            return fused_plus - fused_minus
+        return self._synergy_from_outcomes(
+            fused_plus,
+            fused_minus,
+            masked_plus,
+            masked_minus,
+        )
 
     def _encode_with_counterfactual_context(self):
         """Encode once and retain tensors shared by all interventions."""
@@ -550,7 +582,7 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
                 negative_item,
             )
             targets.append(
-                self._synergy_from_outcomes(
+                self._counterfactual_target_from_outcomes(
                     fused_plus,
                     fused_minus,
                     masked_plus,
@@ -712,6 +744,12 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
             'tau_syn_positive_fraction': (
                 tau_positive_fraction.detach()
             ),
+            # Generic aliases describe both supported target modes. Keep the
+            # tau_syn keys above so existing training logs remain compatible.
+            'cf_target_mean': tau_mean.detach(),
+            'cf_target_positive_fraction': (
+                tau_positive_fraction.detach()
+            ),
         }
         return total_loss
 
@@ -753,6 +791,11 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
             ),
             'observed_tau_syn_mean': observed_mean.detach().cpu(),
             'observed_tau_syn_count': counts.detach().cpu(),
+            # The legacy tau_syn fields contain the configured target. These
+            # generic aliases avoid mislabelling fused-effect experiments.
+            'observed_cf_target_mean': observed_mean.detach().cpu(),
+            'observed_cf_target_count': counts.detach().cpu(),
+            'cf_target_mode': self.cf_target_mode,
             'lambda_c': self.lambda_c,
             'lambda_cf': self.lambda_cf,
             'cf_warmup_epochs': self.cf_warmup_epochs,
@@ -776,6 +819,7 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
             'cf_huber_beta': self.cf_huber_beta,
             'cf_rank_temperature': self.cf_rank_temperature,
             'cf_min_tau_gap': self.cf_min_tau_gap,
+            'cf_target_mode': self.cf_target_mode,
             'cf_epoch': int(self.cf_epoch.item()),
         })
         return artifacts

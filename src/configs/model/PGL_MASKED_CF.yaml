@@ -30,6 +30,9 @@ semantic_mask_variant: semantic_only
 lambda_sem: 1.0
 
 # Counterfactual synergy supervision.
+# synergy:      (O_F+M^+ - O_F+M^-) - (O_M^+ - O_M^-)
+# fused_effect:  O_F+M^+ - O_F+M^-
+cf_target_mode: fused_effect
 lambda_c: 1.0
 lambda_cf: 0.1
 cf_samples_per_batch: 2

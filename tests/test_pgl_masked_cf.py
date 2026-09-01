@@ -87,7 +87,9 @@ class PGLMaskedCFTest(unittest.TestCase):
     def tearDown(self):
         self.temporary_directory.cleanup()
 
-    def config(self, warmup=10, lambda_cf=0.1):
+    def config(
+        self, warmup=10, lambda_cf=0.1, target_mode='synergy'
+    ):
         return NullableConfig({
             'USER_ID_FIELD': 'user_id',
             'ITEM_ID_FIELD': 'item_id',
@@ -121,6 +123,7 @@ class PGLMaskedCFTest(unittest.TestCase):
             'cf_huber_beta': 0.1,
             'cf_rank_temperature': 0.2,
             'cf_min_tau_gap': 1e-6,
+            'cf_target_mode': target_mode,
             'cl_weight': 0.05,
             'cl_temperature': 0.2,
             'dropout': 0.0,
@@ -137,9 +140,15 @@ class PGLMaskedCFTest(unittest.TestCase):
             torch.tensor([3, 2, 0]),
         )
 
-    def model(self, warmup=10, lambda_cf=0.1):
+    def model(
+        self, warmup=10, lambda_cf=0.1, target_mode='synergy'
+    ):
         return TestablePGLMaskedCF(
-            self.config(warmup=warmup, lambda_cf=lambda_cf),
+            self.config(
+                warmup=warmup,
+                lambda_cf=lambda_cf,
+                target_mode=target_mode,
+            ),
             self.train_data,
         )
 
@@ -226,6 +235,27 @@ class PGLMaskedCFTest(unittest.TestCase):
             torch.tensor(0.20),
         )
         torch.testing.assert_close(synergy, torch.tensor(0.10))
+
+    def test_configurable_counterfactual_target(self):
+        outcomes = (
+            torch.tensor(0.61),
+            torch.tensor(0.49),
+            torch.tensor(0.22),
+            torch.tensor(0.20),
+        )
+        synergy_model = self.model(target_mode='synergy')
+        fused_effect_model = self.model(target_mode='fused_effect')
+
+        torch.testing.assert_close(
+            synergy_model._counterfactual_target_from_outcomes(*outcomes),
+            torch.tensor(0.10),
+        )
+        torch.testing.assert_close(
+            fused_effect_model._counterfactual_target_from_outcomes(
+                *outcomes
+            ),
+            torch.tensor(0.12),
+        )
 
     def test_ten_complete_warmup_epochs(self):
         model = self.model(warmup=10)
@@ -347,6 +377,9 @@ class PGLMaskedCFTest(unittest.TestCase):
         )
         self.assertIn('observed_tau_syn_mean', mask_artifact)
         self.assertIn('observed_tau_syn_count', mask_artifact)
+        self.assertIn('observed_cf_target_mean', mask_artifact)
+        self.assertIn('observed_cf_target_count', mask_artifact)
+        self.assertEqual(mask_artifact['cf_target_mode'], 'synergy')
 
         restored = self.model(warmup=0)
         restored.load_state_dict(model.state_dict())
