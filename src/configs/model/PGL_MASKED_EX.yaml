@@ -1,0 +1,42 @@
+embedding_size: 64
+feat_embed_dim: 64
+# Each U-I branch is 128D because visual and textual 64D features are concatenated.
+dual_modal_branch_dim: 128
+dual_modal_output_dim: 128
+
+learning_rate_scheduler: [0.96, 50]
+learning_rate: 0.001
+
+n_mm_layers: 1
+n_ui_layers: 2
+knn_k: 10
+mm_image_weight: 0.1
+
+# Full-graph and semantic-guided masked U-I branches.
+cl_weight: 0.05
+cl_temperature: 0.2
+dropout: 0.2
+mask_weight: 0.0
+
+mask_keep_ratio: 0.3
+mask_binary_weight: 0.1
+# full: use D_full; masked: recompute degrees from the masked graph.
+mask_degree_mode: full
+# PGL_MASKED_EX supports hard and soft; hard is the primary experiment.
+mask_graph_mode: hard
+# shared: both branches share user tables; separate: one pair per branch.
+user_embedding_mode: separate
+# PGL_MASKED_EX intentionally supports only full + masked dual branches.
+ui_branch_mode: dual
+hard_mask_temperature: 1.0
+
+# semantic_only: score = lambda_sem * q_sem
+# prior_residual: score = residual_logit + lambda_sem * q_sem
+semantic_mask_variant: prior_residual
+lambda_sem: 1.0
+
+# Save the best-validation mask decomposition, embeddings and representations.
+save_analysis_artifacts: True
+restore_best_model: True
+
+hyper_parameters: []
