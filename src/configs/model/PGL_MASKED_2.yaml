@@ -1,0 +1,36 @@
+embedding_size: 64
+feat_embed_dim: 64
+# Each visual/text U-I branch is 128D; concat 256D is projected to 128D.
+dual_modal_branch_dim: 128
+dual_modal_output_dim: 128
+
+learning_rate_scheduler: [0.96, 50]
+learning_rate: 0.001
+
+n_mm_layers: 1
+n_ui_layers: 2
+knn_k: 10
+mm_image_weight: 0.1
+
+# Two-branch masked user-item graph learning.
+cl_weight: 0.5
+cl_temperature: 0.2
+dropout: 0.2
+mask_weight: 0.1
+
+mask_keep_ratio: 0.3
+mask_binary_weight: 0.1
+# full: use D_full for faster edge gating; masked: recompute D_mask.
+mask_degree_mode: full
+# hard keeps the configured fraction of observed U-I edges.
+mask_graph_mode: hard
+# Use a different user table for each U-I branch.
+user_embedding_mode: separate
+ui_branch_mode: dual
+ui_fusion_mode: gated_sum
+hard_mask_temperature: 1.0
+
+save_analysis_artifacts: True
+restore_best_model: True
+
+hyper_parameters: []
