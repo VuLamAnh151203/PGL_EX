@@ -13,7 +13,7 @@ knn_k: 10
 mm_image_weight: 0.1
 
 # Two-branch masked user-item graph learning.
-cl_weight: 0.05
+cl_weight: 0.1
 cl_temperature: 0.2
 dropout: 0.2
 mask_weight: 0.1
