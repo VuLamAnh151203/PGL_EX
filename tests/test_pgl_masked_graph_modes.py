@@ -58,7 +58,13 @@ class TestablePGLMasked(PGL_MASKED):
 
 
 class PGLGraphModeTest(unittest.TestCase):
-    def make_config(self, root, graph_mode, ui_branch_mode='dual'):
+    def make_config(
+        self,
+        root,
+        graph_mode,
+        ui_branch_mode='dual',
+        ui_fusion_mode='gated_sum',
+    ):
         return NullableConfig({
             'USER_ID_FIELD': 'user_id',
             'ITEM_ID_FIELD': 'item_id',
@@ -81,6 +87,7 @@ class PGLGraphModeTest(unittest.TestCase):
             'mask_graph_mode': graph_mode,
             'user_embedding_mode': 'separate',
             'ui_branch_mode': ui_branch_mode,
+            'ui_fusion_mode': ui_fusion_mode,
             'dual_modal_branch_dim': 2,
             'dual_modal_output_dim': 4,
             'cl_weight': 0.05,
@@ -112,9 +119,17 @@ class PGLGraphModeTest(unittest.TestCase):
             ], dtype=np.float32),
         )
 
-    def make_model(self, root, graph_mode, ui_branch_mode='dual'):
+    def make_model(
+        self,
+        root,
+        graph_mode,
+        ui_branch_mode='dual',
+        ui_fusion_mode='gated_sum',
+    ):
         return TestablePGLMasked(
-            self.make_config(root, graph_mode, ui_branch_mode),
+            self.make_config(
+                root, graph_mode, ui_branch_mode, ui_fusion_mode
+            ),
             FakeTrainData(),
         )
 
@@ -204,6 +219,36 @@ class PGLGraphModeTest(unittest.TestCase):
             self.assertIs(inference_second, model.norm_adj)
             model.train()
             self.assert_forward_and_loss(model)
+
+    def test_gated_concat_projects_back_to_ui_dimension(self):
+        with tempfile.TemporaryDirectory() as temporary_root:
+            self.write_features(temporary_root)
+            model = self.make_model(
+                temporary_root,
+                'double_full',
+                ui_fusion_mode='gated_concat',
+            )
+
+            self.assertEqual(model.fusion_projection.in_features, 8)
+            self.assertEqual(model.fusion_projection.out_features, 4)
+            users, items = model.forward()
+            self.assertEqual(tuple(users.shape), (3, 4))
+            self.assertEqual(tuple(items.shape), (4, 4))
+
+            interaction = (
+                torch.tensor([0, 2]),
+                torch.tensor([0, 3]),
+                torch.tensor([2, 0]),
+            )
+            loss = model.calculate_loss(interaction)
+            loss.backward()
+            self.assertIsNotNone(model.fusion_projection.weight.grad)
+            self.assertEqual(
+                model.get_analysis_artifacts()['metadata'][
+                    'ui_fusion_mode'
+                ],
+                'gated_concat',
+            )
 
 
 if __name__ == '__main__':

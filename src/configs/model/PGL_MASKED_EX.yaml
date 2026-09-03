@@ -28,6 +28,8 @@ mask_graph_mode: hard
 user_embedding_mode: separate
 # PGL_MASKED_EX intentionally supports only full + masked dual branches.
 ui_branch_mode: dual
+# gated_sum or gated_concat (concatenate gated branches, then project to 128D).
+ui_fusion_mode: gated_sum
 hard_mask_temperature: 1.0
 
 # semantic_only: score = lambda_sem * q_sem

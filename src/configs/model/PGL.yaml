@@ -1,5 +1,5 @@
-embedding_size: 64
-feat_embed_dim: 64
+embedding_size: 128
+feat_embed_dim: 128
 weight_size: [64, 64]
 
 learning_rate_scheduler: [0.96, 50]

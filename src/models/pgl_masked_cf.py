@@ -1039,12 +1039,9 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
         )
         selected_full = full_nodes[node_ids]
         selected_masked = masked_nodes[node_ids]
-        gate = torch.sigmoid(
-            self.fusion_gate(
-                torch.cat((selected_full, selected_masked), dim=1)
-            )
+        fused, _ = self._fuse_ui_branches(
+            selected_full, selected_masked
         )
-        fused = gate * selected_full + (1.0 - gate) * selected_masked
 
         fused_user = fused[0]
         fused_positive = fused[1] + mm_items[positive_item]
@@ -1079,34 +1076,23 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
 
         full_user = full_nodes[user_node]
         masked_user = masked_nodes[user_node]
-        user_gate = torch.sigmoid(self.fusion_gate(torch.cat(
-            (full_user, masked_user), dim=0
-        )))
-        fused_user = (
-            user_gate * full_user + (1.0 - user_gate) * masked_user
+        fused_user, _ = self._fuse_ui_branches(
+            full_user, masked_user
         )
 
         full_positive = full_nodes[positive_nodes]
         masked_positive = masked_nodes[positive_nodes]
-        positive_gate = torch.sigmoid(self.fusion_gate(torch.cat(
-            (full_positive, masked_positive), dim=1
-        )))
-        fused_positive = (
-            positive_gate * full_positive
-            + (1.0 - positive_gate) * masked_positive
-            + mm_items[positive_items]
+        fused_positive, _ = self._fuse_ui_branches(
+            full_positive, masked_positive
         )
+        fused_positive = fused_positive + mm_items[positive_items]
 
         full_negative = full_nodes[negative_nodes]
         masked_negative = masked_nodes[negative_nodes]
-        negative_gate = torch.sigmoid(self.fusion_gate(torch.cat(
-            (full_negative, masked_negative), dim=1
-        )))
-        fused_negative = (
-            negative_gate * full_negative
-            + (1.0 - negative_gate) * masked_negative
-            + mm_items[negative_items]
+        fused_negative, _ = self._fuse_ui_branches(
+            full_negative, masked_negative
         )
+        fused_negative = fused_negative + mm_items[negative_items]
         return (
             (fused_positive * fused_user).sum(dim=1)
             - (fused_negative * fused_user).sum(dim=1)
@@ -1221,10 +1207,9 @@ class PGL_MASKED_CF(PGL_MASKED_EX):
             self.norm_adj, full_initial
         )
 
-        gate = torch.sigmoid(
-            self.fusion_gate(torch.cat((full_nodes, masked_nodes), dim=1))
+        fused_nodes, _ = self._fuse_ui_branches(
+            full_nodes, masked_nodes
         )
-        fused_nodes = gate * full_nodes + (1.0 - gate) * masked_nodes
         full_users, full_items = torch.split(
             full_nodes, [self.n_users, self.n_items], dim=0
         )

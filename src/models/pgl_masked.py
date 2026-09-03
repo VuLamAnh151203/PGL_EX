@@ -6,8 +6,9 @@ can use a soft mask, a hard sparse mask, an SVD graph, a locally pruned graph,
 or the complete graph as an ablation. Local pruning follows the original PGL:
 the subgraph is used for training and the complete graph for inference. Masked
 modes can use either full-graph degrees or degrees recomputed from the masked
-weights. Branch outputs are combined by a learnable gate before adding the
-multimodal item-item representation.
+weights. Branch outputs use either a gated sum or a gated concatenation
+projected back to the branch dimension before adding the multimodal item-item
+representation.
 """
 
 import math
@@ -68,6 +69,9 @@ class PGL_MASKED(GeneralRecommender):
         self.ui_branch_mode = str(
             _config_value(config, 'ui_branch_mode', 'dual')
         ).lower()
+        self.ui_fusion_mode = str(
+            _config_value(config, 'ui_fusion_mode', 'gated_sum')
+        ).lower()
 
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
@@ -104,6 +108,18 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError(
                 "ui_branch_mode must be 'dual', 'masked_only', "
                 "or 'dual_modal'."
+            )
+        if self.ui_fusion_mode not in {'gated_sum', 'gated_concat'}:
+            raise ValueError(
+                "ui_fusion_mode must be 'gated_sum' or 'gated_concat'."
+            )
+        if (
+            self.ui_fusion_mode == 'gated_concat'
+            and self.ui_branch_mode != 'dual'
+        ):
+            raise ValueError(
+                "ui_fusion_mode='gated_concat' requires "
+                "ui_branch_mode='dual'."
             )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
@@ -204,6 +220,14 @@ class PGL_MASKED(GeneralRecommender):
         )
         nn.init.xavier_uniform_(self.fusion_gate.weight)
         nn.init.zeros_(self.fusion_gate.bias)
+        if self.ui_fusion_mode == 'gated_concat':
+            self.fusion_projection = nn.Linear(
+                2 * self.ui_embedding_dim, self.ui_embedding_dim
+            )
+            nn.init.xavier_uniform_(self.fusion_projection.weight)
+            nn.init.zeros_(self.fusion_projection.bias)
+        else:
+            self.fusion_projection = None
         self.cl_dropout_layer = nn.Dropout(self.cl_dropout)
 
         self._build_or_load_mm_graph(config)
@@ -707,6 +731,22 @@ class PGL_MASKED(GeneralRecommender):
             )
         return self.mm_output_projection(propagated_items)
 
+    def _fuse_ui_branches(self, full_embeddings, masked_embeddings):
+        branch_embeddings = torch.cat(
+            (full_embeddings, masked_embeddings), dim=-1
+        )
+        gate = torch.sigmoid(self.fusion_gate(branch_embeddings))
+        gated_full = gate * full_embeddings
+        gated_masked = (1.0 - gate) * masked_embeddings
+        if self.ui_fusion_mode == 'gated_concat':
+            gated_branches = torch.cat(
+                (gated_full, gated_masked), dim=-1
+            )
+            fused_embeddings = self.fusion_projection(gated_branches)
+        else:
+            fused_embeddings = gated_full + gated_masked
+        return fused_embeddings, gate
+
     def _encode_dual_modal(
         self, multimodal_items
     ):
@@ -806,13 +846,8 @@ class PGL_MASKED(GeneralRecommender):
             self.norm_adj, full_initial_embeddings
         )
 
-        branch_embeddings = torch.cat(
-            (full_embeddings, masked_embeddings), dim=1
-        )
-        gate = torch.sigmoid(self.fusion_gate(branch_embeddings))
-        fused_embeddings = (
-            gate * full_embeddings
-            + (1.0 - gate) * masked_embeddings
+        fused_embeddings, _ = self._fuse_ui_branches(
+            full_embeddings, masked_embeddings
         )
 
         full_users, full_items = torch.split(
@@ -1013,6 +1048,7 @@ class PGL_MASKED(GeneralRecommender):
                 'mask_graph_mode': self.mask_graph_mode,
                 'mask_degree_mode': self.mask_degree_mode,
                 'ui_branch_mode': self.ui_branch_mode,
+                'ui_fusion_mode': self.ui_fusion_mode,
                 'user_embedding_mode': self.user_embedding_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'num_users': self.n_users,

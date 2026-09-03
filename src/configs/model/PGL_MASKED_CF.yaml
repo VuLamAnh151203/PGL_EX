@@ -22,6 +22,8 @@ mask_degree_mode: full
 mask_graph_mode: hard
 user_embedding_mode: separate
 ui_branch_mode: dual
+# gated_sum or gated_concat (concatenate gated branches, then project to 128D).
+ui_fusion_mode: gated_sum
 hard_mask_temperature: 1.0
 
 # Parent initialization only. PGL_MASKED_CF defines its own effective score.
