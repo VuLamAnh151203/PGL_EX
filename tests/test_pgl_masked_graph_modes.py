@@ -151,7 +151,7 @@ class PGLGraphModeTest(unittest.TestCase):
             )
             self.assert_forward_and_loss(model)
 
-    def test_local_prunning_resamples_a_degree_weighted_sparse_branch(self):
+    def test_local_prunning_trains_on_subgraph_and_infers_on_full_graph(self):
         with tempfile.TemporaryDirectory() as temporary_root:
             self.write_features(temporary_root)
             model = self.make_model(temporary_root, 'local_prunning')
@@ -173,6 +173,14 @@ class PGLGraphModeTest(unittest.TestCase):
                 restored.local_pruned_adj.to_dense(),
                 model.local_pruned_adj.to_dense(),
             )
+
+            model.eval()
+            inference_adjacency, inference_mask = (
+                model._masked_ui_adjacency()
+            )
+            self.assertIs(inference_adjacency, model.norm_adj)
+            self.assertIsNone(inference_mask)
+            model.train()
             self.assert_forward_and_loss(model)
 
     def test_dual_modal_keeps_first_branch_full(self):
@@ -188,6 +196,13 @@ class PGLGraphModeTest(unittest.TestCase):
             self.assertIs(second_adjacency, model.local_pruned_adj)
             self.assertIsNone(first_mask)
             self.assertIsNone(second_mask)
+
+            model.eval()
+            inference_first, _ = model._masked_ui_adjacency(False)
+            inference_second, _ = model._masked_ui_adjacency(True)
+            self.assertIs(inference_first, model.norm_adj)
+            self.assertIs(inference_second, model.norm_adj)
+            model.train()
             self.assert_forward_and_loss(model)
 
 

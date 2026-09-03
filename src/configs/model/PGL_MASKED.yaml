@@ -26,7 +26,7 @@ mask_degree_mode: full
 # soft: weighted full graph; hard: retain mask_keep_ratio edges;
 # double_full: no mask, both branches use the complete U-I graph;
 # svd: one full branch and one original-PGL global SVD branch;
-# local_prunning: one full branch and one original-PGL locally pruned branch.
+# local_prunning: full + locally pruned during training; full + full at inference.
 # mask_graph_mode: double_full
 mask_graph_mode: local_prunning
 # shared: both branches share user tables; separate: one table pair per branch.

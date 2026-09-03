@@ -3,10 +3,11 @@ PGL with two-branch masked user-item graph learning.
 
 The two branches share the same initial node embeddings. The second branch
 can use a soft mask, a hard sparse mask, an SVD graph, a locally pruned graph,
-or the complete graph as an ablation. Masked modes can use either full-graph
-degrees or degrees recomputed from the masked weights. Branch outputs are
-combined by a learnable gate before adding the multimodal item-item
-representation.
+or the complete graph as an ablation. Local pruning follows the original PGL:
+the subgraph is used for training and the complete graph for inference. Masked
+modes can use either full-graph degrees or degrees recomputed from the masked
+weights. Branch outputs are combined by a learnable gate before adding the
+multimodal item-item representation.
 """
 
 import math
@@ -538,6 +539,8 @@ class PGL_MASKED(GeneralRecommender):
                 return self.norm_adj, None
             if self.mask_graph_mode == 'svd':
                 return self.svd_adj, None
+            if not self.training:
+                return self.norm_adj, None
             if self.local_pruned_adj is None:
                 self.local_pruned_adj = (
                     self._sample_local_pruned_adjacency()
