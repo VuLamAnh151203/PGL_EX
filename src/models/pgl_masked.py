@@ -2,19 +2,22 @@ r"""
 PGL with two-branch masked user-item graph learning.
 
 The two branches share the same initial node embeddings. The second branch
-can use a soft mask, a hard sparse mask, or the complete graph as an ablation.
-Masked modes can use either full-graph degrees or degrees recomputed from the
-masked weights. Branch outputs are combined by a learnable gate before adding
-the multimodal item-item representation.
+can use a soft mask, a hard sparse mask, an SVD graph, a locally pruned graph,
+or the complete graph as an ablation. Masked modes can use either full-graph
+degrees or degrees recomputed from the masked weights. Branch outputs are
+combined by a learnable gate before adding the multimodal item-item
+representation.
 """
 
 import math
 import os
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.sparse.linalg import svds
 
 from common.abstract_recommender import GeneralRecommender
 
@@ -81,9 +84,12 @@ class PGL_MASKED(GeneralRecommender):
             raise ValueError(
                 "mask_degree_mode must be either 'full' or 'masked'."
             )
-        if self.mask_graph_mode not in {'soft', 'hard', 'double_full'}:
+        if self.mask_graph_mode not in {
+            'soft', 'hard', 'double_full', 'svd', 'local_prunning'
+        }:
             raise ValueError(
-                "mask_graph_mode must be 'soft', 'hard', or 'double_full'."
+                "mask_graph_mode must be 'soft', 'hard', 'double_full', "
+                "'svd', or 'local_prunning'."
             )
         if self.hard_mask_temperature <= 0.0:
             raise ValueError('hard_mask_temperature must be positive.')
@@ -219,7 +225,9 @@ class PGL_MASKED(GeneralRecommender):
         initial_logit = math.log(
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
-        if self.mask_graph_mode == 'double_full':
+        if self.mask_graph_mode in {
+            'double_full', 'svd', 'local_prunning'
+        }:
             self.register_parameter('mask_logits', None)
         else:
             self.mask_logits = nn.Parameter(
@@ -227,7 +235,7 @@ class PGL_MASKED(GeneralRecommender):
             )
         if (
             self.ui_branch_mode == 'dual_modal'
-            and self.mask_graph_mode != 'double_full'
+            and self.mask_graph_mode in {'soft', 'hard'}
         ):
             self.second_mask_logits = nn.Parameter(
                 torch.full((self.num_interactions,), initial_logit)
@@ -264,6 +272,96 @@ class PGL_MASKED(GeneralRecommender):
         )
         norm_adj = self._ui_adjacency_from_weights(full_norm_edge_weights)
         self.register_buffer('norm_adj', norm_adj)
+
+        self.register_buffer('svd_adj', None)
+        self.register_buffer('local_pruned_adj', None)
+        if self.mask_graph_mode == 'svd':
+            self.svd_adj = self._svd_subgraph_extraction(norm_adj)
+        elif self.mask_graph_mode == 'local_prunning':
+            self.local_pruned_adj = self._sample_local_pruned_adjacency()
+
+    def _svd_subgraph_extraction(self, adjacency):
+        """Build the global SVD subgraph used by the original PGL."""
+        adjacency = adjacency.coalesce().cpu()
+        indices = adjacency.indices().numpy()
+        values = adjacency.values().numpy().astype(np.float64, copy=False)
+        scipy_adjacency = sp.coo_matrix(
+            (values, (indices[0], indices[1])),
+            shape=(self.n_nodes, self.n_nodes),
+        ).tocsc()
+
+        rank = min(self.embedding_dim, self.n_nodes - 1)
+        left_vectors, singular_values, right_vectors = svds(
+            scipy_adjacency, k=rank
+        )
+        # ``sparsesvd``, used by the original implementation, returns values
+        # from largest to smallest. Restore that ordering for SciPy's svds.
+        order = np.argsort(singular_values)[::-1]
+        singular_values = singular_values[order]
+        left_vectors = left_vectors[:, order]
+        right_vectors = right_vectors[order, :]
+
+        num_top_bottom = max(1, int(0.25 * rank))
+        top_values = singular_values[:num_top_bottom]
+        bottom_values = singular_values[-num_top_bottom:]
+        product_values = top_values * bottom_values
+        product_matrix = (
+            left_vectors[:, :num_top_bottom]
+            @ np.diag(product_values)
+            @ right_vectors[:num_top_bottom, :]
+        )
+        product_matrix *= np.abs(product_matrix) >= 1e-3
+        product_sparse = sp.coo_matrix(product_matrix)
+
+        svd_indices = torch.from_numpy(
+            np.vstack((product_sparse.row, product_sparse.col)).astype(
+                np.int64, copy=False
+            )
+        ).to(self.ui_edge_index.device)
+        svd_values = torch.from_numpy(
+            product_sparse.data.astype(np.float32, copy=False)
+        ).to(self.ui_edge_index.device)
+        return torch.sparse_coo_tensor(
+            svd_indices,
+            svd_values,
+            (self.n_nodes, self.n_nodes),
+            device=self.ui_edge_index.device,
+        ).coalesce()
+
+    @property
+    def local_keep_count(self):
+        # The original PGL keeps 30% of edges. mask_keep_ratio defaults to
+        # 0.3 and makes the same local-pruning method configurable here.
+        return max(
+            1,
+            min(
+                self.num_interactions,
+                int(self.num_interactions * self.mask_keep_ratio),
+            ),
+        )
+
+    @torch.no_grad()
+    def _sample_local_pruned_adjacency(self):
+        """Degree-weighted local edge pruning from the original PGL."""
+        sampling_weights = self.full_norm_edge_weights[
+            :self.num_interactions
+        ]
+        kept_interactions = torch.multinomial(
+            sampling_weights,
+            self.local_keep_count,
+            replacement=False,
+        )
+        reverse_interactions = kept_interactions + self.num_interactions
+        kept_undirected = torch.cat(
+            (kept_interactions, reverse_interactions), dim=0
+        )
+        edge_index = self.ui_edge_index[:, kept_undirected]
+        edge_weights = torch.ones(
+            edge_index.size(1),
+            dtype=self.full_norm_edge_weights.dtype,
+            device=edge_index.device,
+        )
+        return self._normalized_ui_adjacency(edge_weights, edge_index)
 
     def _normalized_ui_edge_weights(self, edge_weights, edge_index=None):
         if edge_index is None:
@@ -348,6 +446,8 @@ class PGL_MASKED(GeneralRecommender):
                         self.second_mask_logits
                     )
                 )
+        elif self.mask_graph_mode == 'local_prunning':
+            self.local_pruned_adj = self._sample_local_pruned_adjacency()
 
     def post_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
@@ -429,6 +529,20 @@ class PGL_MASKED(GeneralRecommender):
     def _masked_ui_adjacency(self, second_branch=False):
         if self.mask_graph_mode == 'double_full':
             return self.norm_adj, None
+
+        if self.mask_graph_mode in {'svd', 'local_prunning'}:
+            # In dual-modal mode the visual branch is the full branch and the
+            # text branch receives the PGL alternative graph. In the regular
+            # dual mode this method is called only for the second branch.
+            if self.ui_branch_mode == 'dual_modal' and not second_branch:
+                return self.norm_adj, None
+            if self.mask_graph_mode == 'svd':
+                return self.svd_adj, None
+            if self.local_pruned_adj is None:
+                self.local_pruned_adj = (
+                    self._sample_local_pruned_adjacency()
+                )
+            return self.local_pruned_adj, None
 
         mask_logits = (
             self.second_mask_logits if second_branch else self.mask_logits

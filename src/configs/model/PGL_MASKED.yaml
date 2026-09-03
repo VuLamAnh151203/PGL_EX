@@ -24,9 +24,11 @@ mask_binary_weight: 0.1
 # full: use D_full for faster edge gating; masked: recompute D_mask.
 mask_degree_mode: full
 # soft: weighted full graph; hard: retain mask_keep_ratio edges;
-# double_full: no mask, both branches use the complete U-I graph.
+# double_full: no mask, both branches use the complete U-I graph;
+# svd: one full branch and one original-PGL global SVD branch;
+# local_prunning: one full branch and one original-PGL locally pruned branch.
 # mask_graph_mode: double_full
-mask_graph_mode: soft
+mask_graph_mode: svd
 # shared: both branches share user tables; separate: one table pair per branch.
 user_embedding_mode: separate
 # dual: full + second branch; masked_only: only the second branch;
