@@ -739,9 +739,12 @@ class PGL_MASKED(GeneralRecommender):
         gated_full = gate * full_embeddings
         gated_masked = (1.0 - gate) * masked_embeddings
         if self.ui_fusion_mode == 'gated_concat':
+            # gated_branches = torch.cat(
+            #     (gated_full, gated_masked), dim=-1
+            # )
             gated_branches = torch.cat(
-                (gated_full, gated_masked), dim=-1
-            )
+                            (full_embeddings, masked_embeddings), dim=-1
+                        )
             fused_embeddings = self.fusion_projection(gated_branches)
         else:
             fused_embeddings = gated_full + gated_masked

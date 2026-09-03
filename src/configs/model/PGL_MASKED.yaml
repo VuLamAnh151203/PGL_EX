@@ -16,8 +16,8 @@ mm_image_weight: 0.1
 cl_weight: 0.05
 cl_temperature: 0.2
 dropout: 0.2
-# mask_weight: 0.1
-mask_weight: 0.0
+mask_weight: 0.1
+# mask_weight: 0.0
 
 mask_keep_ratio: 0.3
 mask_binary_weight: 0.1
