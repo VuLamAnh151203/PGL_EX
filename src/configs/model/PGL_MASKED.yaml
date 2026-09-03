@@ -28,7 +28,7 @@ mask_degree_mode: full
 # svd: one full branch and one original-PGL global SVD branch;
 # local_prunning: full + locally pruned during training; full + full at inference.
 # mask_graph_mode: double_full
-mask_graph_mode: local_prunning
+mask_graph_mode: svd
 # shared: both branches share user tables; separate: one table pair per branch.
 user_embedding_mode: separate
 # dual: full + second branch; masked_only: only the second branch;
