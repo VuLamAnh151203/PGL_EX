@@ -9,11 +9,14 @@ normalization.
 Example:
     python src/mask_analysis/spectral_complementarity.py \
         --analysis-file src/saved/PGL_MASKED-baby-...-analysis.pt \
+        --analyze-user-embeddings \
         --output-json src/saved/PGL_MASKED-baby-spectral.json
 """
 
 import argparse
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -21,6 +24,8 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import scipy.sparse as sp
 import torch
+from scipy.cluster.vq import kmeans2
+from scipy.optimize import linear_sum_assignment
 from scipy.sparse.linalg import ArpackNoConvergence, svds
 
 
@@ -56,6 +61,16 @@ def _as_numpy_vector(value: Any, field_name: str) -> np.ndarray:
     if value.ndim != 1:
         raise ValueError("{} must be a one-dimensional vector.".format(field_name))
     return value
+
+
+def _as_numpy_matrix(value: Any, field_name: str) -> np.ndarray:
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    else:
+        value = np.asarray(value)
+    if value.ndim != 2:
+        raise ValueError("{} must be a two-dimensional matrix.".format(field_name))
+    return value.astype(np.float64, copy=False)
 
 
 def _positive_metadata_int(metadata: Mapping[str, Any], key: str) -> int:
@@ -239,10 +254,8 @@ def extract_graph_views(
     )
 
 
-def load_graph_views(
-    analysis_file: Path, branch: str = "masked_branch"
-) -> GraphViews:
-    """Load a PyTorch analysis artifact and return its graph views."""
+def _load_analysis_artifact(analysis_file: Path) -> Mapping[str, Any]:
+    """Load and minimally validate a PyTorch analysis artifact."""
     analysis_file = Path(analysis_file)
     if not analysis_file.is_file():
         raise ValueError("Analysis file does not exist: {}".format(analysis_file))
@@ -253,7 +266,144 @@ def load_graph_views(
     except TypeError:
         # Compatibility with the older PyTorch versions supported by the repo.
         artifact = torch.load(str(analysis_file), map_location="cpu")
+    if not isinstance(artifact, Mapping):
+        raise ValueError("The analysis artifact must contain a mapping.")
+    return artifact
+
+
+def load_graph_views(
+    analysis_file: Path, branch: str = "masked_branch"
+) -> GraphViews:
+    """Load a PyTorch analysis artifact and return its graph views."""
+    artifact = _load_analysis_artifact(analysis_file)
     return extract_graph_views(artifact, branch)
+
+
+def extract_user_representations(
+    artifact: Mapping[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract aligned full/masked user representations from an artifact."""
+    if not isinstance(artifact, Mapping):
+        raise ValueError("The analysis artifact must contain a mapping.")
+    representations = artifact.get("representations")
+    if not isinstance(representations, Mapping):
+        raise ValueError("The analysis artifact is missing representations.")
+
+    required_keys = ("full_users", "masked_users")
+    missing = [key for key in required_keys if key not in representations]
+    if missing:
+        raise ValueError(
+            "representations is missing: {}.".format(", ".join(missing))
+        )
+    full_users = _as_numpy_matrix(
+        representations["full_users"], "representations.full_users"
+    )
+    masked_users = _as_numpy_matrix(
+        representations["masked_users"], "representations.masked_users"
+    )
+    if full_users.shape != masked_users.shape:
+        raise ValueError(
+            "representations.full_users and representations.masked_users "
+            "must have the same shape."
+        )
+    if min(full_users.shape) <= 1:
+        raise ValueError("User representation matrices must be non-trivial.")
+    if not np.all(np.isfinite(full_users)):
+        raise ValueError("representations.full_users must contain finite values.")
+    if not np.all(np.isfinite(masked_users)):
+        raise ValueError("representations.masked_users must contain finite values.")
+    if np.linalg.norm(full_users) <= 0.0:
+        raise ValueError("representations.full_users must have positive energy.")
+    if np.linalg.norm(masked_users) <= 0.0:
+        raise ValueError("representations.masked_users must have positive energy.")
+
+    metadata = artifact.get("metadata")
+    if isinstance(metadata, Mapping) and "num_users" in metadata:
+        num_users = _positive_metadata_int(metadata, "num_users")
+        if full_users.shape[0] != num_users:
+            raise ValueError(
+                "The number of representation rows ({}) does not match "
+                "metadata.num_users ({}).".format(full_users.shape[0], num_users)
+            )
+    return full_users, masked_users
+
+
+def load_user_representations(
+    analysis_file: Path,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load full_users and masked_users without retaining the whole artifact."""
+    artifact = _load_analysis_artifact(analysis_file)
+    return extract_user_representations(artifact)
+
+
+def extract_pre_propagation_user_representations(
+    artifact: Mapping[str, Any],
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """Extract learned full/masked user tables before graph propagation."""
+    if not isinstance(artifact, Mapping):
+        raise ValueError("The analysis artifact must contain a mapping.")
+    embedding_tables = artifact.get("embedding_tables")
+    if not isinstance(embedding_tables, Mapping):
+        raise ValueError("The analysis artifact is missing embedding_tables.")
+
+    pairs = {}
+    for modality in ("text", "image"):
+        full_key = "user_{}.weight".format(modality)
+        masked_key = "second_user_{}.weight".format(modality)
+        missing = [
+            key for key in (full_key, masked_key) if key not in embedding_tables
+        ]
+        if missing:
+            raise ValueError(
+                "embedding_tables is missing: {}.".format(", ".join(missing))
+            )
+        full_users = _as_numpy_matrix(
+            embedding_tables[full_key],
+            "embedding_tables.{}".format(full_key),
+        )
+        masked_users = _as_numpy_matrix(
+            embedding_tables[masked_key],
+            "embedding_tables.{}".format(masked_key),
+        )
+        if full_users.shape != masked_users.shape:
+            raise ValueError(
+                "embedding_tables.{} and embedding_tables.{} must have the "
+                "same shape.".format(full_key, masked_key)
+            )
+        if min(full_users.shape) <= 1:
+            raise ValueError(
+                "Pre-propagation {} user embedding matrices must be "
+                "non-trivial.".format(modality)
+            )
+        if not np.all(np.isfinite(full_users)) or not np.all(
+            np.isfinite(masked_users)
+        ):
+            raise ValueError(
+                "Pre-propagation {} user embeddings must contain only "
+                "finite values.".format(modality)
+            )
+        if (
+            np.linalg.norm(full_users) <= 0.0
+            or np.linalg.norm(masked_users) <= 0.0
+        ):
+            raise ValueError(
+                "Pre-propagation {} user embeddings must have positive "
+                "energy.".format(modality)
+            )
+        pairs[modality] = (full_users, masked_users)
+
+    metadata = artifact.get("metadata")
+    if isinstance(metadata, Mapping) and "num_users" in metadata:
+        num_users = _positive_metadata_int(metadata, "num_users")
+        for modality, (full_users, _) in pairs.items():
+            if full_users.shape[0] != num_users:
+                raise ValueError(
+                    "The {} embedding row count ({}) does not match "
+                    "metadata.num_users ({}).".format(
+                        modality, full_users.shape[0], num_users
+                    )
+                )
+    return pairs
 
 
 def validate_k_values(k_values: Iterable[int], shape: Tuple[int, int]) -> Tuple[int, ...]:
@@ -275,6 +425,33 @@ def validate_k_values(k_values: Iterable[int], shape: Tuple[int, int]) -> Tuple[
             "Every k value must be smaller than min(matrix.shape)={}.".format(
                 dimension_limit
             )
+        )
+    return values
+
+
+def _validate_dense_k_values(
+    k_values: Iterable[int], shape: Tuple[int, int]
+) -> Tuple[int, ...]:
+    """Validate ranks for an exact dense SVD, including the full rank."""
+    try:
+        values = tuple(k_values)
+    except TypeError as error:
+        raise ValueError("k_values must be an iterable of integers.") from error
+    if not values:
+        raise ValueError("At least one k value is required.")
+    if any(
+        isinstance(k, bool) or not isinstance(k, (int, np.integer))
+        for k in values
+    ):
+        raise ValueError("Every k value must be an integer.")
+    values = tuple(sorted(set(int(k) for k in values)))
+    if values[0] <= 0:
+        raise ValueError("Every k value must be positive.")
+    dimension_limit = min(shape)
+    if values[-1] > dimension_limit:
+        raise ValueError(
+            "Every k value must be at most min(matrix.shape)={} for an "
+            "exact dense SVD.".format(dimension_limit)
         )
     return values
 
@@ -543,6 +720,234 @@ def analyze_spectral_complementarity(
     )["weighted"]
 
 
+def _dense_decomposition(matrix: np.ndarray) -> _SpectralDecomposition:
+    """Compute an exact, descending SVD for a dense embedding matrix."""
+    left, singular_values, right_transposed = np.linalg.svd(
+        matrix, full_matrices=False
+    )
+    order = np.argsort(singular_values)[::-1]
+    return _SpectralDecomposition(
+        left=left[:, order],
+        singular_values=singular_values[order],
+        right_transposed=right_transposed[order, :],
+        frobenius_energy=float(np.square(matrix).sum()),
+    )
+
+
+def _distribution_summary(values: np.ndarray) -> Dict[str, float]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("Cannot summarize an empty value distribution.")
+    return {
+        "minimum": float(values.min()),
+        "quantile_05": float(np.quantile(values, 0.05)),
+        "quantile_25": float(np.quantile(values, 0.25)),
+        "median": float(np.median(values)),
+        "quantile_75": float(np.quantile(values, 0.75)),
+        "quantile_95": float(np.quantile(values, 0.95)),
+        "maximum": float(values.max()),
+        "mean": float(values.mean()),
+        "standard_deviation": float(values.std()),
+    }
+
+
+def analyze_user_representations(
+    full_users: np.ndarray,
+    masked_users: np.ndarray,
+    k_values: Sequence[int] = DEFAULT_K_VALUES,
+    full_source_key: str = "representations.full_users",
+    masked_source_key: str = "representations.masked_users",
+) -> Dict[str, Any]:
+    """Compare aligned full-branch and masked-branch user representations.
+
+    Spectral metrics use the uncentered ``num_users x embedding_dim`` matrices
+    to stay analogous to the graph analysis. Linear CKA and orthogonal
+    Procrustes metrics use centered matrices and are insensitive to a shared
+    translation; both are also invariant to isotropic scaling and orthogonal
+    changes of basis.
+    """
+    full_users = _as_numpy_matrix(full_users, "full_users")
+    masked_users = _as_numpy_matrix(masked_users, "masked_users")
+    if full_users.shape != masked_users.shape:
+        raise ValueError(
+            "full_users and masked_users must have the same shape."
+        )
+    if min(full_users.shape) <= 1:
+        raise ValueError("User representation matrices must be non-trivial.")
+    if not np.all(np.isfinite(full_users)):
+        raise ValueError("full_users must contain only finite values.")
+    if not np.all(np.isfinite(masked_users)):
+        raise ValueError("masked_users must contain only finite values.")
+
+    full_energy = float(np.square(full_users).sum())
+    masked_energy = float(np.square(masked_users).sum())
+    if full_energy <= 0.0 or masked_energy <= 0.0:
+        raise ValueError("Both user representation matrices need positive energy.")
+    checked_k_values = _validate_dense_k_values(k_values, full_users.shape)
+
+    full_decomposition = _dense_decomposition(full_users)
+    masked_decomposition = _dense_decomposition(masked_users)
+    spectral = _compare_decompositions(
+        full_decomposition,
+        masked_decomposition,
+        full_users.shape,
+        checked_k_values,
+    )
+
+    full_norms = np.linalg.norm(full_users, axis=1)
+    masked_norms = np.linalg.norm(masked_users, axis=1)
+    epsilon = np.finfo(np.float64).eps
+    valid_cosine = (full_norms > epsilon) & (masked_norms > epsilon)
+    if not np.any(valid_cosine):
+        raise ValueError(
+            "No user has non-zero representations in both branches."
+        )
+    paired_cosines = np.einsum(
+        "ij,ij->i", full_users[valid_cosine], masked_users[valid_cosine]
+    )
+    paired_cosines /= full_norms[valid_cosine] * masked_norms[valid_cosine]
+    paired_cosines = np.clip(paired_cosines, -1.0, 1.0)
+
+    valid_full_norm = full_norms > epsilon
+    norm_ratios = masked_norms[valid_full_norm] / full_norms[valid_full_norm]
+
+    centered_full = full_users - full_users.mean(axis=0, keepdims=True)
+    centered_masked = masked_users - masked_users.mean(axis=0, keepdims=True)
+    centered_full_energy = float(np.square(centered_full).sum())
+    centered_masked_energy = float(np.square(centered_masked).sum())
+    if centered_full_energy <= epsilon or centered_masked_energy <= epsilon:
+        raise ValueError(
+            "Centered user representations must have positive energy."
+        )
+
+    cross_covariance = centered_full.T @ centered_masked
+    full_covariance = centered_full.T @ centered_full
+    masked_covariance = centered_masked.T @ centered_masked
+    cka_denominator = float(
+        np.linalg.norm(full_covariance, ord="fro")
+        * np.linalg.norm(masked_covariance, ord="fro")
+    )
+    linear_cka = float(
+        np.square(cross_covariance).sum() / cka_denominator
+    )
+    linear_cka = float(np.clip(linear_cka, 0.0, 1.0))
+
+    procrustes_left, procrustes_values, procrustes_right_t = np.linalg.svd(
+        cross_covariance, full_matrices=False
+    )
+    rotation = procrustes_left @ procrustes_right_t
+    aligned_full = centered_full @ rotation
+    procrustes_similarity = float(
+        procrustes_values.sum()
+        / np.sqrt(centered_full_energy * centered_masked_energy)
+    )
+    procrustes_similarity = float(
+        np.clip(procrustes_similarity, 0.0, 1.0)
+    )
+    procrustes_relative_error = float(
+        np.linalg.norm(aligned_full - centered_masked)
+        / np.sqrt(centered_masked_energy)
+    )
+    optimal_procrustes_scale = float(
+        procrustes_values.sum() / centered_full_energy
+    )
+    scaled_procrustes_relative_error = float(
+        np.linalg.norm(
+            optimal_procrustes_scale * aligned_full - centered_masked
+        )
+        / np.sqrt(centered_masked_energy)
+    )
+
+    metrics = []
+    for metric in spectral["metrics"]:
+        metrics.append({
+            "k": metric["k"],
+            "full_spectral_energy": metric["original_spectral_energy"],
+            "masked_spectral_energy": metric["weighted_spectral_energy"],
+            "spectral_energy_delta": metric["spectral_energy_delta"],
+            "user_subspace_overlap": metric["user_subspace_overlap"],
+            "feature_subspace_overlap": metric["item_subspace_overlap"],
+            "complementarity": metric["complementarity"],
+        })
+
+    maximum_k = checked_k_values[-1]
+    full_share_key = "original_within_top_{}_share".format(maximum_k)
+    masked_share_key = "weighted_within_top_{}_share".format(maximum_k)
+    bands = []
+    for band in spectral["spectral_bands"]:
+        bands.append({
+            "label": band["label"],
+            "start_rank": band["start_rank"],
+            "end_rank": band["end_rank"],
+            "full_global_energy_contribution": band[
+                "original_global_energy_contribution"
+            ],
+            "masked_global_energy_contribution": band[
+                "weighted_global_energy_contribution"
+            ],
+            "global_energy_contribution_delta": band[
+                "global_energy_contribution_delta"
+            ],
+            "full_within_top_{}_share".format(maximum_k): band[
+                full_share_key
+            ],
+            "masked_within_top_{}_share".format(maximum_k): band[
+                masked_share_key
+            ],
+            "within_top_{}_share_delta".format(maximum_k): band[
+                "within_top_{}_share_delta".format(maximum_k)
+            ],
+        })
+
+    return {
+        "source_keys": {
+            "full": str(full_source_key),
+            "masked": str(masked_source_key),
+        },
+        "matrix_shape": [int(full_users.shape[0]), int(full_users.shape[1])],
+        "spectral_centered": False,
+        "k_values": list(checked_k_values),
+        "frobenius_energy": {
+            "full": full_energy,
+            "masked": masked_energy,
+        },
+        "singular_values": {
+            "full": spectral["singular_values"]["original"],
+            "masked": spectral["singular_values"]["weighted"],
+        },
+        "metrics": metrics,
+        "spectral_bands": bands,
+        "paired_user_similarity": {
+            "valid_user_count": int(valid_cosine.sum()),
+            "excluded_zero_norm_user_count": int((~valid_cosine).sum()),
+            "cosine_similarity": _distribution_summary(paired_cosines),
+            "masked_to_full_norm_ratio": _distribution_summary(norm_ratios),
+            "raw_relative_frobenius_difference": float(
+                np.linalg.norm(masked_users - full_users)
+                / np.sqrt(full_energy)
+            ),
+            "masked_to_full_frobenius_norm_ratio": float(
+                np.sqrt(masked_energy / full_energy)
+            ),
+        },
+        "global_similarity": {
+            "centered_linear_cka": linear_cka,
+            "centered_orthogonal_procrustes_similarity": (
+                procrustes_similarity
+            ),
+            "centered_orthogonal_procrustes_relative_error": (
+                procrustes_relative_error
+            ),
+            "centered_scaled_procrustes_optimal_scale": (
+                optimal_procrustes_scale
+            ),
+            "centered_scaled_procrustes_relative_error": (
+                scaled_procrustes_relative_error
+            ),
+        },
+    }
+
+
 def _random_hard_graphs(
     original: sp.csr_matrix,
     selected_count: int,
@@ -672,6 +1077,302 @@ def _summarize_random_baseline(
     }
 
 
+def _spectral_node_embeddings(
+    original: sp.csr_matrix,
+    candidate: sp.csr_matrix,
+    rank: int,
+    seed: int,
+    tolerance: float,
+    max_iterations: Optional[int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return U sqrt(S) and V sqrt(S) coordinates for two graph views."""
+    checked_rank = validate_k_values((rank,), original.shape)[0]
+    random_generator = np.random.RandomState(int(seed))
+    initial_vector = random_generator.standard_normal(min(original.shape))
+    initial_vector /= np.linalg.norm(initial_vector)
+    original_left, original_values, original_right_t = _truncated_svd(
+        original,
+        checked_rank,
+        initial_vector,
+        tolerance,
+        max_iterations,
+    )
+    candidate_left, candidate_values, candidate_right_t = _truncated_svd(
+        candidate,
+        checked_rank,
+        initial_vector,
+        tolerance,
+        max_iterations,
+    )
+    original_scale = np.sqrt(np.maximum(original_values, 0.0))
+    candidate_scale = np.sqrt(np.maximum(candidate_values, 0.0))
+    return (
+        original_left * original_scale,
+        candidate_left * candidate_scale,
+        original_right_t.T * original_scale,
+        candidate_right_t.T * candidate_scale,
+    )
+
+
+def _normalize_embedding_rows(embeddings: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    return np.divide(
+        embeddings,
+        norms,
+        out=np.zeros_like(embeddings),
+        where=norms > 1e-12,
+    )
+
+
+def _cluster_active_nodes(
+    embeddings: np.ndarray,
+    active: np.ndarray,
+    num_clusters: int,
+    seed: int,
+) -> np.ndarray:
+    active_count = int(active.sum())
+    if active_count < num_clusters:
+        raise ValueError(
+            "Cannot create {} clusters from only {} active nodes.".format(
+                num_clusters, active_count
+            )
+        )
+    normalized = _normalize_embedding_rows(embeddings[active])
+    _, active_labels = kmeans2(
+        normalized,
+        num_clusters,
+        iter=100,
+        thresh=1e-6,
+        minit="++",
+        missing="raise",
+        check_finite=True,
+        seed=np.random.RandomState(int(seed)),
+    )
+    labels = np.full(embeddings.shape[0], -1, dtype=np.int64)
+    labels[active] = active_labels
+    return labels
+
+
+def _aligned_transition_matrix(
+    original_labels: np.ndarray,
+    candidate_labels: np.ndarray,
+    original_active: np.ndarray,
+    candidate_active: np.ndarray,
+    num_clusters: int,
+) -> Dict[str, Any]:
+    active_in_both = original_active & candidate_active
+    matching_counts = np.zeros((num_clusters, num_clusters), dtype=np.int64)
+    np.add.at(
+        matching_counts,
+        (
+            original_labels[active_in_both],
+            candidate_labels[active_in_both],
+        ),
+        1,
+    )
+    matched_original, matched_candidate = linear_sum_assignment(
+        -matching_counts
+    )
+    candidate_to_aligned = np.empty(num_clusters, dtype=np.int64)
+    candidate_to_aligned[matched_candidate] = matched_original
+
+    aligned_candidate_labels = np.full_like(candidate_labels, -1)
+    aligned_candidate_labels[candidate_active] = candidate_to_aligned[
+        candidate_labels[candidate_active]
+    ]
+    counts = np.zeros((num_clusters, num_clusters + 1), dtype=np.int64)
+    np.add.at(
+        counts,
+        (
+            original_labels[active_in_both],
+            aligned_candidate_labels[active_in_both],
+        ),
+        1,
+    )
+    isolated_after_mask = original_active & ~candidate_active
+    np.add.at(
+        counts,
+        (original_labels[isolated_after_mask], np.full(isolated_after_mask.sum(), num_clusters)),
+        1,
+    )
+    row_totals = counts.sum(axis=1, keepdims=True)
+    percentages = np.divide(
+        counts,
+        row_totals,
+        out=np.zeros_like(counts, dtype=np.float64),
+        where=row_totals > 0,
+    )
+    total_active = int(original_active.sum())
+    retained_count = int(np.trace(counts[:, :num_clusters]))
+    isolated_count = int(isolated_after_mask.sum())
+    return {
+        "counts": counts.tolist(),
+        "row_percentages": percentages.tolist(),
+        "original_active_nodes": total_active,
+        "candidate_active_nodes": int(candidate_active.sum()),
+        "isolated_after_mask": isolated_count,
+        "isolated_ratio": isolated_count / total_active,
+        "aligned_cluster_retention_ratio": retained_count / total_active,
+        "aligned_cluster_transition_ratio": 1.0 - retained_count / total_active,
+        "candidate_cluster_alignment": candidate_to_aligned.tolist(),
+    }
+
+
+def generate_cluster_transition_heatmap(
+    analysis_file: Path,
+    output_file: Path,
+    branch: str = "masked_branch",
+    rank: int = 64,
+    num_clusters: int = 8,
+    seed: int = 0,
+    tolerance: float = 1e-7,
+    max_iterations: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Cluster spectral node embeddings and plot original-to-hard transitions."""
+    if isinstance(num_clusters, bool) or not isinstance(
+        num_clusters, (int, np.integer)
+    ):
+        raise ValueError("num_clusters must be an integer.")
+    if num_clusters < 2:
+        raise ValueError("num_clusters must be at least 2.")
+    graph_views = load_graph_views(analysis_file, branch)
+    if graph_views.hard_masked is None:
+        raise ValueError(
+            "Mask branch {!r} does not contain selected_at_keep_ratio.".format(
+                branch
+            )
+        )
+
+    original = graph_views.original
+    hard_masked = graph_views.hard_masked
+    original_users, hard_users, original_items, hard_items = (
+        _spectral_node_embeddings(
+            original,
+            hard_masked,
+            rank=rank,
+            seed=seed,
+            tolerance=tolerance,
+            max_iterations=max_iterations,
+        )
+    )
+    original_user_active = np.asarray(original.getnnz(axis=1) > 0).ravel()
+    hard_user_active = np.asarray(hard_masked.getnnz(axis=1) > 0).ravel()
+    original_item_active = np.asarray(original.getnnz(axis=0) > 0).ravel()
+    hard_item_active = np.asarray(hard_masked.getnnz(axis=0) > 0).ravel()
+
+    original_user_labels = _cluster_active_nodes(
+        original_users, original_user_active, num_clusters, seed
+    )
+    hard_user_labels = _cluster_active_nodes(
+        hard_users, hard_user_active, num_clusters, seed + 1
+    )
+    original_item_labels = _cluster_active_nodes(
+        original_items, original_item_active, num_clusters, seed + 2
+    )
+    hard_item_labels = _cluster_active_nodes(
+        hard_items, hard_item_active, num_clusters, seed + 3
+    )
+
+    user_transition = _aligned_transition_matrix(
+        original_user_labels,
+        hard_user_labels,
+        original_user_active,
+        hard_user_active,
+        num_clusters,
+    )
+    item_transition = _aligned_transition_matrix(
+        original_item_labels,
+        hard_item_labels,
+        original_item_active,
+        hard_item_active,
+        num_clusters,
+    )
+
+    try:
+        matplotlib_config = Path(tempfile.gettempdir()) / "pgl_matplotlib_cache"
+        matplotlib_config.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", str(matplotlib_config))
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except ImportError as error:
+        raise RuntimeError(
+            "matplotlib is required to generate the cluster-transition heatmap."
+        ) from error
+
+    figure, axes = plt.subplots(
+        1, 2, figsize=(18, 7), constrained_layout=True
+    )
+    column_labels = [
+        "Hard C{}".format(index + 1) for index in range(num_clusters)
+    ] + ["Isolated"]
+    row_labels = [
+        "Original C{}".format(index + 1) for index in range(num_clusters)
+    ]
+    image = None
+    for axis, title, transition in (
+        (axes[0], "User cluster transitions", user_transition),
+        (axes[1], "Item cluster transitions", item_transition),
+    ):
+        percentages = np.asarray(transition["row_percentages"]) * 100.0
+        image = axis.imshow(
+            percentages, cmap="Blues", vmin=0.0, vmax=100.0, aspect="auto"
+        )
+        axis.set_xticks(np.arange(num_clusters + 1), labels=column_labels)
+        axis.set_yticks(np.arange(num_clusters), labels=row_labels)
+        axis.tick_params(axis="x", labelrotation=45)
+        axis.set_xlabel("Learned hard-mask clusters")
+        axis.set_ylabel("Original-graph clusters")
+        axis.set_title(
+            "{}\n{} isolated after mask ({:.1%})".format(
+                title,
+                transition["isolated_after_mask"],
+                transition["isolated_ratio"],
+            )
+        )
+        annotation_threshold = max(10.0, float(percentages.max()) * 0.45)
+        for row_index in range(num_clusters):
+            for column_index in range(num_clusters + 1):
+                value = percentages[row_index, column_index]
+                if value < 0.5:
+                    continue
+                axis.text(
+                    column_index,
+                    row_index,
+                    "{:.1f}".format(value),
+                    ha="center",
+                    va="center",
+                    color="white" if value >= annotation_threshold else "black",
+                    fontsize=8,
+                )
+    figure.colorbar(
+        image,
+        ax=axes.ravel().tolist(),
+        label="Percentage of each original cluster",
+        shrink=0.9,
+    )
+    figure.suptitle(
+        "Spectral cluster transitions: original graph to learned hard mask "
+        "(rank={}, clusters={})".format(rank, num_clusters),
+        fontsize=14,
+    )
+    output_file = Path(output_file).resolve()
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(str(output_file), dpi=220, bbox_inches="tight")
+    plt.close(figure)
+
+    return {
+        "output_file": str(output_file),
+        "rank": int(rank),
+        "num_clusters": int(num_clusters),
+        "cluster_embedding": "row_l2_normalized_U_or_V_times_sqrt_sigma",
+        "cluster_label_alignment": "hungarian_maximum_overlap",
+        "user": user_transition,
+        "item": item_transition,
+    }
+
+
 def analyze_artifact(
     analysis_file: Path,
     branch: str = "masked_branch",
@@ -682,6 +1383,7 @@ def analyze_artifact(
     include_hard: bool = False,
     random_baseline_runs: int = 0,
     random_baseline_seed: int = 0,
+    include_user_embeddings: bool = False,
 ) -> Dict[str, Any]:
     """Load an artifact and produce a JSON-serializable analysis result."""
     graph_views = load_graph_views(analysis_file, branch)
@@ -769,6 +1471,41 @@ def analyze_artifact(
                 selected_count=selected_count,
                 total_edges=int(probabilities.size),
             )
+    if include_user_embeddings:
+        embedding_artifact = _load_analysis_artifact(analysis_file)
+        full_users, masked_users = extract_user_representations(
+            embedding_artifact
+        )
+        pre_propagation_pairs = extract_pre_propagation_user_representations(
+            embedding_artifact
+        )
+        del embedding_artifact
+        result["user_embedding_analysis"] = analyze_user_representations(
+            full_users,
+            masked_users,
+            k_values=k_values,
+        )
+        result["pre_propagation_user_embedding_analysis"] = {
+            "stage": "learned_embedding_tables_before_graph_propagation",
+            "text": analyze_user_representations(
+                pre_propagation_pairs["text"][0],
+                pre_propagation_pairs["text"][1],
+                k_values=k_values,
+                full_source_key="embedding_tables.user_text.weight",
+                masked_source_key=(
+                    "embedding_tables.second_user_text.weight"
+                ),
+            ),
+            "image": analyze_user_representations(
+                pre_propagation_pairs["image"][0],
+                pre_propagation_pairs["image"][1],
+                k_values=k_values,
+                full_source_key="embedding_tables.user_image.weight",
+                masked_source_key=(
+                    "embedding_tables.second_user_image.weight"
+                ),
+            ),
+        }
     return result
 
 
@@ -812,6 +1549,99 @@ def _print_spectral_band_table(analysis: Mapping[str, Any]) -> None:
             "{weighted_within_share:15.6f}".format(
                 original_within_share=band[original_share_key],
                 weighted_within_share=band[weighted_share_key],
+                **band
+            )
+        )
+
+
+def _print_user_embedding_analysis(analysis: Mapping[str, Any]) -> None:
+    rows, columns = analysis["matrix_shape"]
+    source_keys = analysis["source_keys"]
+    paired = analysis["paired_user_similarity"]
+    cosine = paired["cosine_similarity"]
+    norm_ratio = paired["masked_to_full_norm_ratio"]
+    global_similarity = analysis["global_similarity"]
+    print(
+        "User representations: {} vs {}".format(
+            source_keys["full"], source_keys["masked"]
+        )
+    )
+    print("Matrix: {} users x {} embedding dimensions".format(rows, columns))
+    print(
+        "Paired cosine: mean={:.6f}, median={:.6f}, p05={:.6f}, "
+        "p95={:.6f}".format(
+            cosine["mean"],
+            cosine["median"],
+            cosine["quantile_05"],
+            cosine["quantile_95"],
+        )
+    )
+    print(
+        "Masked/full user-norm ratio: mean={:.6f}, median={:.6f}; "
+        "global norm ratio={:.6f}".format(
+            norm_ratio["mean"],
+            norm_ratio["median"],
+            paired["masked_to_full_frobenius_norm_ratio"],
+        )
+    )
+    print(
+        "Centered linear CKA={:.6f}; Procrustes similarity={:.6f}; "
+        "scale-aligned error={:.6f} (optimal scale={:.6f})".format(
+            global_similarity["centered_linear_cka"],
+            global_similarity[
+                "centered_orthogonal_procrustes_similarity"
+            ],
+            global_similarity[
+                "centered_scaled_procrustes_relative_error"
+            ],
+            global_similarity[
+                "centered_scaled_procrustes_optimal_scale"
+            ],
+        )
+    )
+    print(
+        "{:>4} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
+            "k",
+            "C_full",
+            "C_masked",
+            "delta_C",
+            "overlap_U",
+            "overlap_feat",
+            "comp_k",
+        )
+    )
+    for metric in analysis["metrics"]:
+        print(
+            "{k:4d} {full_spectral_energy:12.6f} "
+            "{masked_spectral_energy:12.6f} {spectral_energy_delta:12.6f} "
+            "{user_subspace_overlap:12.6f} "
+            "{feature_subspace_overlap:12.6f} "
+            "{complementarity:12.6f}".format(**metric)
+        )
+
+    maximum_k = analysis["k_values"][-1]
+    full_share_key = "full_within_top_{}_share".format(maximum_k)
+    masked_share_key = "masked_within_top_{}_share".format(maximum_k)
+    print("Embedding spectral-band contribution")
+    print(
+        "{:>9} {:>13} {:>13} {:>13} {:>15} {:>15}".format(
+            "band",
+            "global_full",
+            "global_mask",
+            "global_delta",
+            "within_full",
+            "within_mask",
+        )
+    )
+    for band in analysis["spectral_bands"]:
+        print(
+            "{label:>9} {full_global_energy_contribution:13.6f} "
+            "{masked_global_energy_contribution:13.6f} "
+            "{global_energy_contribution_delta:13.6f} "
+            "{full_within_share:15.6f} "
+            "{masked_within_share:15.6f}".format(
+                full_within_share=band[full_share_key],
+                masked_within_share=band[masked_share_key],
                 **band
             )
         )
@@ -898,6 +1728,23 @@ def print_report(result: Mapping[str, Any]) -> None:
                     **band
                 )
             )
+    user_embedding_analysis = result.get("user_embedding_analysis")
+    if user_embedding_analysis is not None:
+        print()
+        print("Post-propagation user representations")
+        _print_user_embedding_analysis(user_embedding_analysis)
+    pre_propagation_analysis = result.get(
+        "pre_propagation_user_embedding_analysis"
+    )
+    if pre_propagation_analysis is not None:
+        for modality in ("text", "image"):
+            print()
+            print(
+                "Pre-propagation {} user embedding tables".format(modality)
+            )
+            _print_user_embedding_analysis(
+                pre_propagation_analysis[modality]
+            )
     print()
     print("delta_C < 0: the weighted spectrum is less concentrated.")
     print("Larger comp_k: less overlap between dominant user/item subspaces.")
@@ -978,6 +1825,32 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=0,
         help="Seed used to sample random hard masks (default: 0).",
     )
+    parser.add_argument(
+        "--cluster-transition-heatmap",
+        type=Path,
+        default=None,
+        metavar="PNG",
+        help=(
+            "Optional output path for user/item cluster-transition heatmaps "
+            "between the original and learned hard graph."
+        ),
+    )
+    parser.add_argument(
+        "--num-clusters",
+        type=int,
+        default=8,
+        help="Number of spectral user/item clusters in the heatmap (default: 8).",
+    )
+    parser.add_argument(
+        "--analyze-user-embeddings",
+        action="store_true",
+        help=(
+            "Compare representations.full_users with masked_users and also "
+            "compare the pre-propagation user_text/second_user_text and "
+            "user_image/second_user_image tables using paired cosine, "
+            "centered CKA, Procrustes, and exact dense spectral metrics."
+        ),
+    )
     return parser
 
 
@@ -992,11 +1865,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             seed=arguments.seed,
             tolerance=arguments.tol,
             max_iterations=arguments.maxiter,
-            include_hard=arguments.include_hard,
+            include_hard=(
+                arguments.include_hard
+                or arguments.cluster_transition_heatmap is not None
+            ),
             random_baseline_runs=arguments.random_baseline_runs,
             random_baseline_seed=arguments.random_baseline_seed,
+            include_user_embeddings=arguments.analyze_user_embeddings,
         )
+        cluster_transition = None
+        if arguments.cluster_transition_heatmap is not None:
+            cluster_transition = generate_cluster_transition_heatmap(
+                arguments.analysis_file,
+                arguments.cluster_transition_heatmap,
+                branch=arguments.branch,
+                rank=max(arguments.k_values),
+                num_clusters=arguments.num_clusters,
+                seed=arguments.seed,
+                tolerance=arguments.tol,
+                max_iterations=arguments.maxiter,
+            )
+            result["cluster_transition"] = cluster_transition
         print_report(result)
+        if cluster_transition is not None:
+            print(
+                "Saved cluster-transition heatmap to {}".format(
+                    cluster_transition["output_file"]
+                )
+            )
+            print(
+                "User: transition={:.2%}, isolated={:.2%}; "
+                "Item: transition={:.2%}, isolated={:.2%}".format(
+                    cluster_transition["user"][
+                        "aligned_cluster_transition_ratio"
+                    ],
+                    cluster_transition["user"]["isolated_ratio"],
+                    cluster_transition["item"][
+                        "aligned_cluster_transition_ratio"
+                    ],
+                    cluster_transition["item"]["isolated_ratio"],
+                )
+            )
         if arguments.output_json is not None:
             output_path = arguments.output_json.resolve()
             output_path.parent.mkdir(parents=True, exist_ok=True)
