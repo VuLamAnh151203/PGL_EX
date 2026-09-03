@@ -36,7 +36,7 @@ user_embedding_mode: separate
 ui_branch_mode: dual
 # gated_sum: g*H_full + (1-g)*H_masked;
 # gated_concat: Linear([g*H_full || (1-g)*H_masked]) back to 128D.
-ui_fusion_mode: gated_concat
+ui_fusion_mode: gated_sum
 # Controls stochastic Gumbel top-k exploration during training.
 hard_mask_temperature: 1.0
 
