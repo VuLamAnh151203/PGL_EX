@@ -79,7 +79,9 @@ class MaskedGloriaTest(unittest.TestCase):
         )
 
     @staticmethod
-    def make_config(root, image_weight=0.25):
+    def make_config(
+        root, image_weight=0.25, cl_weight=0.0, dropout=0.2
+    ):
         return NullableConfig(
             {
                 'USER_ID_FIELD': 'user_id',
@@ -103,12 +105,18 @@ class MaskedGloriaTest(unittest.TestCase):
                 'mask_keep_ratio': 0.3,
                 'mask_weight': 0.1,
                 'mask_binary_weight': 0.1,
+                'cl_weight': cl_weight,
+                'cl_temperature': 0.2,
+                'dropout': dropout,
             }
         )
 
-    def make_model(self, root, image_weight=0.25):
+    def make_model(
+        self, root, image_weight=0.25, cl_weight=0.0, dropout=0.2
+    ):
         return MASKED_GLORIA(
-            self.make_config(root, image_weight), FakeTrainData()
+            self.make_config(root, image_weight, cl_weight, dropout),
+            FakeTrainData(),
         )
 
     @staticmethod
@@ -146,6 +154,62 @@ class MaskedGloriaTest(unittest.TestCase):
             self.assertGreater(model.mask_logits.grad.abs().sum().item(), 0.0)
             self.assertIsNotNone(model.id_embedding_full.weight.grad)
             torch.testing.assert_close(interaction, original_interaction)
+
+    def test_cl_weight_zero_skips_infonce(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root, cl_weight=0.0)
+            with mock.patch.object(
+                model,
+                'InfoNCE',
+                side_effect=AssertionError('InfoNCE should be disabled'),
+            ):
+                loss = model.calculate_loss(self.training_interaction())
+
+            self.assertTrue(torch.isfinite(loss))
+            self.assertEqual(
+                model.latest_loss_components['contrastive'].item(), 0.0
+            )
+
+    def test_positive_cl_weight_adds_original_pgl_infonce(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root, cl_weight=0.5, dropout=0.0)
+            loss = model.calculate_loss(self.training_interaction())
+            components = model.latest_loss_components
+
+            self.assertTrue(torch.isfinite(components['contrastive']))
+            self.assertGreater(components['contrastive'].item(), 0.0)
+            expected = (
+                components['bpr']
+                + 0.5 * components['contrastive']
+                + 0.1 * components['mask']
+            )
+            torch.testing.assert_close(loss.detach(), expected)
+            loss.backward()
+            self.assertIsNotNone(model.mask_logits.grad)
+
+    def test_infonce_matches_original_pgl_formula(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root)
+            first = torch.tensor([[1.0, 0.0], [0.2, 0.8]])
+            second = torch.tensor([[0.9, 0.1], [0.0, 1.0]])
+            temperature = 0.2
+
+            normalized_first = torch.nn.functional.normalize(first, dim=1)
+            normalized_second = torch.nn.functional.normalize(second, dim=1)
+            positive_scores = torch.exp(
+                (normalized_first * normalized_second).sum(dim=1)
+                / temperature
+            )
+            total_scores = torch.exp(
+                normalized_first @ normalized_second.transpose(0, 1)
+                / temperature
+            ).sum(dim=1)
+            expected = -torch.log(positive_scores / total_scores).mean()
+            actual = model.InfoNCE(first, second, temperature)
+            torch.testing.assert_close(actual, expected)
 
     def test_three_hop_gcn_matches_dense_reference(self):
         features = torch.tensor([[0.6, 0.8], [0.8, -0.6]])

@@ -48,6 +48,11 @@ class MASKED_GLORIA(GeneralRecommender):
         self.mask_binary_weight = float(
             _config_value(config, 'mask_binary_weight', 0.1)
         )
+        self.cl_weight = float(_config_value(config, 'cl_weight', 0.0))
+        self.cl_temperature = float(
+            _config_value(config, 'cl_temperature', 0.2)
+        )
+        self.cl_dropout = float(_config_value(config, 'dropout', 0.2))
         self.aggr_mode = str(_config_value(config, 'aggr_mode', 'add')).lower()
         self.fusion = str(_config_value(config, 'fusion', 'concat')).lower()
 
@@ -67,6 +72,12 @@ class MASKED_GLORIA(GeneralRecommender):
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
         if self.mask_weight < 0.0 or self.mask_binary_weight < 0.0:
             raise ValueError('Mask loss weights must be non-negative.')
+        if self.cl_weight < 0.0:
+            raise ValueError('cl_weight must be non-negative.')
+        if self.cl_temperature <= 0.0:
+            raise ValueError('cl_temperature must be positive.')
+        if not 0.0 <= self.cl_dropout < 1.0:
+            raise ValueError('dropout must be in the interval [0, 1).')
         if self.aggr_mode != 'add':
             raise ValueError("MASKED_GLORIA only supports aggr_mode='add'.")
         if self.fusion != 'concat':
@@ -159,6 +170,7 @@ class MASKED_GLORIA(GeneralRecommender):
 
         mm_adj = self._build_or_load_mm_graph(config)
         self.register_buffer('mm_adj', mm_adj.coalesce())
+        self.cl_dropout_layer = nn.Dropout(self.cl_dropout)
         self.latest_loss_components = {}
         self.result_embed = None
 
@@ -358,6 +370,16 @@ class MASKED_GLORIA(GeneralRecommender):
         )
         return positive_scores, negative_scores
 
+    def InfoNCE(self, view1, view2, temperature=None):
+        """One-direction dropout-view InfoNCE used by the original PGL."""
+        if temperature is None:
+            temperature = self.cl_temperature
+        view1 = F.normalize(view1, p=2, dim=1, eps=1e-12)
+        view2 = F.normalize(view2, p=2, dim=1, eps=1e-12)
+        logits = torch.matmul(view1, view2.transpose(0, 1)) / temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)
+
     def calculate_loss(self, interaction):
         positive_scores, negative_scores = self.forward(interaction)
         ranking_loss = -F.logsigmoid(
@@ -371,10 +393,33 @@ class MASKED_GLORIA(GeneralRecommender):
             interaction_mask * (1.0 - interaction_mask)
         ).mean()
         mask_loss = budget_loss + self.mask_binary_weight * binary_loss
-        total_loss = ranking_loss + self.mask_weight * mask_loss
+
+        if self.cl_weight > 0.0:
+            user_embeddings = self.result_embed[interaction[0]]
+            positive_item_embeddings = self.result_embed[
+                interaction[1] + self.n_users
+            ]
+            user_cl_loss = self.InfoNCE(
+                self.cl_dropout_layer(user_embeddings),
+                self.cl_dropout_layer(user_embeddings),
+            )
+            item_cl_loss = self.InfoNCE(
+                self.cl_dropout_layer(positive_item_embeddings),
+                self.cl_dropout_layer(positive_item_embeddings),
+            )
+            contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
+        else:
+            contrastive_loss = ranking_loss.new_zeros(())
+
+        total_loss = (
+            ranking_loss
+            + self.cl_weight * contrastive_loss
+            + self.mask_weight * mask_loss
+        )
 
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
+            'contrastive': contrastive_loss.detach(),
             'mask': mask_loss.detach(),
             'mask_mean': mask_mean.detach(),
         }
@@ -415,6 +460,8 @@ class MASKED_GLORIA(GeneralRecommender):
                 'ui_fusion_mode': 'concat',
                 'user_embedding_mode': 'separate',
                 'mask_keep_ratio': self.mask_keep_ratio,
+                'cl_weight': self.cl_weight,
+                'cl_temperature': self.cl_temperature,
                 'mm_image_weight': self.mm_image_weight,
                 'knn_k': self.knn_k,
                 'n_mm_layers': self.n_layers,

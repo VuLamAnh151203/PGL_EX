@@ -19,6 +19,12 @@ mask_keep_ratio: 0.3
 mask_weight: 0.1
 mask_binary_weight: 0.1
 
+# Original PGL dropout-view contrastive learning. Set cl_weight to 0.0 to
+# disable it completely.
+cl_weight: 0.5
+cl_temperature: 0.2
+dropout: 0.2
+
 # Save the best-validation parameters and aligned mask analysis data.
 save_analysis_artifacts: True
 restore_best_model: True
