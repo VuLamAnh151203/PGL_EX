@@ -10,15 +10,20 @@ knn_k: 10
 mm_image_weight: 0.1
 
 # id: multimodal features only define the I-I graph.
-# multimodal: projected image/text features enter both U-I branches and also
-# follow an independent I-I path before being added to the final item.
+# multimodal: projected image/text features remain concatenated in 2d, while
+# user_image and user_text provide the matching two user-side tables.
 item_embedding_mode: multimodal
 
-# GLORIA keeps additive message aggregation and concatenates its two U-I
-# branches. Other modes are intentionally unsupported in this implementation.
-aggr_mode: add
-fusion: concat
+# parallel (PGL): I-I propagates the original multimodal item features.
+# sequential: each branch's U-I item output propagates through I-I separately.
+mm_propagation_mode: sequential
 
+# concat: preserve the GLORIA branch concatenation (final width 4d).
+# gated_sum: PGL-style gated sum after I-I propagation (final width 2d).
+# Keeping gated_sum fixed lets parallel/sequential be compared at equal width.
+aggr_mode: add
+# fusion: gated_sum
+fusion: concat
 # Soft interaction-mask budget and binarization regularizer.
 mask_keep_ratio: 0.3
 mask_weight: 0.1

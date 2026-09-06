@@ -1,12 +1,13 @@
 """Multimodal, memory-safe MASKED_GLORIA for the PGL pipeline.
 
 This implementation keeps the original GLORIA full and softly masked
-user-item branches, three propagation steps summed with the initial
-embeddings, and concatenation of both branches. ``id`` mode retains the
-original ID-only branch inputs. ``multimodal`` mode feeds projected visual
-and textual features into both U-I branches and through an independent I-I
-path. Edge-index propagation avoids dense ``(n_users + n_items) ** 2``
-gradients for the learnable interaction mask.
+user-item branches and three propagation steps summed with the initial
+embeddings. ``id`` mode retains the original ID-only branch inputs.
+``multimodal`` mode keeps image and text in their concatenated ``2d`` space,
+with one user table per modality as in PGL. I-I propagation can be parallel
+with U-I propagation or sequential after it; the two branches can then be
+concatenated or combined by a PGL-style gated sum. Edge-index propagation
+avoids dense ``(n_users + n_items) ** 2`` mask gradients.
 """
 
 import math
@@ -57,6 +58,9 @@ class MASKED_GLORIA(GeneralRecommender):
         self.item_embedding_mode = str(
             _config_value(config, 'item_embedding_mode', 'id')
         ).lower()
+        self.mm_propagation_mode = str(
+            _config_value(config, 'mm_propagation_mode', 'sequential')
+        ).lower()
         self.aggr_mode = str(_config_value(config, 'aggr_mode', 'add')).lower()
         self.fusion = str(_config_value(config, 'fusion', 'concat')).lower()
 
@@ -86,10 +90,24 @@ class MASKED_GLORIA(GeneralRecommender):
             raise ValueError(
                 "item_embedding_mode must be either 'id' or 'multimodal'."
             )
+        if self.mm_propagation_mode not in {'sequential', 'parallel'}:
+            raise ValueError(
+                "mm_propagation_mode must be 'sequential' or 'parallel'."
+            )
+        if (
+            self.item_embedding_mode == 'id'
+            and self.mm_propagation_mode != 'sequential'
+        ):
+            raise ValueError(
+                "item_embedding_mode='id' only supports "
+                "mm_propagation_mode='sequential'."
+            )
         if self.aggr_mode != 'add':
             raise ValueError("MASKED_GLORIA only supports aggr_mode='add'.")
-        if self.fusion != 'concat':
-            raise ValueError("MASKED_GLORIA only supports fusion='concat'.")
+        if self.fusion not in {'concat', 'gated_sum'}:
+            raise ValueError(
+                "MASKED_GLORIA fusion must be 'concat' or 'gated_sum'."
+            )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
                 'MASKED_GLORIA requires both visual and textual item features.'
@@ -111,7 +129,16 @@ class MASKED_GLORIA(GeneralRecommender):
 
         self.num_user = self.n_users
         self.num_item = self.n_items
-        self.final_embedding_dim = 2 * self.feat_embed_dim
+        self.branch_embedding_dim = (
+            self.feat_embed_dim
+            if self.item_embedding_mode == 'id'
+            else 2 * self.feat_embed_dim
+        )
+        self.final_embedding_dim = (
+            self.branch_embedding_dim
+            if self.fusion == 'gated_sum'
+            else 2 * self.branch_embedding_dim
+        )
 
         interaction_matrix = dataset.inter_matrix(form='coo').astype(
             np.float32
@@ -160,7 +187,8 @@ class MASKED_GLORIA(GeneralRecommender):
             self.text_embedding = None
             self.image_trs = None
             self.text_trs = None
-            self.multimodal_ui_fusion = None
+            self.user_image = None
+            self.user_text = None
             full_gcn_features = self.id_embedding_full.weight
             masked_gcn_features = self.id_embedding_masked.weight
         else:
@@ -178,18 +206,19 @@ class MASKED_GLORIA(GeneralRecommender):
             self.text_trs = nn.Linear(
                 self.t_feat.size(1), self.feat_embed_dim
             )
-            self.multimodal_ui_fusion = nn.Linear(
-                2 * self.feat_embed_dim, self.feat_embed_dim
+            self.user_image = nn.Embedding(
+                self.n_users, self.feat_embed_dim
             )
-            for projection in (
-                self.image_trs,
-                self.text_trs,
-                self.multimodal_ui_fusion,
-            ):
+            self.user_text = nn.Embedding(
+                self.n_users, self.feat_embed_dim
+            )
+            for projection in (self.image_trs, self.text_trs):
                 nn.init.xavier_uniform_(projection.weight)
                 nn.init.zeros_(projection.bias)
+            nn.init.xavier_uniform_(self.user_image.weight)
+            nn.init.xavier_uniform_(self.user_text.weight)
             feature_template = self.v_feat.new_empty(
-                (self.n_items, self.feat_embed_dim)
+                (self.n_items, self.branch_embedding_dim)
             )
             full_gcn_features = feature_template
             masked_gcn_features = feature_template
@@ -204,8 +233,9 @@ class MASKED_GLORIA(GeneralRecommender):
             'num_layer': 3,
             'has_feature': False,
             'dropout': 0.0,
-            'dim_latent': self.feat_embed_dim,
+            'dim_latent': self.branch_embedding_dim,
             'device': self.device,
+            'user_profile': self.item_embedding_mode == 'multimodal',
         }
         self.full_gcn = GCN(
             features=full_gcn_features, **gcn_kwargs
@@ -213,6 +243,16 @@ class MASKED_GLORIA(GeneralRecommender):
         self.mask_gcn = GCN(
             features=masked_gcn_features, **gcn_kwargs
         )
+
+        if self.fusion == 'gated_sum':
+            self.fusion_gate = nn.Linear(
+                2 * self.branch_embedding_dim,
+                self.branch_embedding_dim,
+            )
+            nn.init.xavier_uniform_(self.fusion_gate.weight)
+            nn.init.zeros_(self.fusion_gate.bias)
+        else:
+            self.fusion_gate = None
 
         mm_adj = self._build_or_load_mm_graph(config)
         self.register_buffer('mm_adj', mm_adj.coalesce())
@@ -375,21 +415,31 @@ class MASKED_GLORIA(GeneralRecommender):
         multimodal_items = torch.cat(
             (image_features, text_features), dim=1
         )
-        ui_items = F.normalize(
-            self.multimodal_ui_fusion(multimodal_items),
-            p=2,
-            dim=-1,
-            eps=1e-12,
+        return multimodal_items
+
+    def _fuse_branches(self, full_embeddings, masked_embeddings):
+        """Fuse two same-width branches with the gate used by PGL_MASKED."""
+        concatenated = torch.cat(
+            (full_embeddings, masked_embeddings), dim=1
         )
-        return ui_items, multimodal_items
+        gate = torch.sigmoid(self.fusion_gate(concatenated))
+        fused = (
+            gate * full_embeddings
+            + (1.0 - gate) * masked_embeddings
+        )
+        return fused, gate
 
     def _encode(self):
         if self.item_embedding_mode == 'multimodal':
-            ui_items, multimodal_items = self._multimodal_item_embeddings()
-            full_initial_items = ui_items
-            masked_initial_items = ui_items
+            multimodal_items = self._multimodal_item_embeddings()
+            user_features = torch.cat(
+                (self.user_image.weight, self.user_text.weight), dim=1
+            )
+            full_initial_items = multimodal_items
+            masked_initial_items = multimodal_items
         else:
             multimodal_items = None
+            user_features = None
             full_initial_items = self.id_embedding_full.weight
             masked_initial_items = self.id_embedding_masked.weight
 
@@ -397,6 +447,7 @@ class MASKED_GLORIA(GeneralRecommender):
             self.edge_index,
             full_initial_items,
             edge_norm=self.full_edge_norm,
+            user_features=user_features,
         )
 
         interaction_mask = torch.sigmoid(self.mask_logits)
@@ -406,6 +457,7 @@ class MASKED_GLORIA(GeneralRecommender):
             masked_initial_items,
             edge_mask=edge_mask,
             edge_norm=self.full_edge_norm,
+            user_features=user_features,
         )
 
         full_users, full_items = torch.split(
@@ -414,16 +466,33 @@ class MASKED_GLORIA(GeneralRecommender):
         masked_users, masked_items = torch.split(
             masked_rep, [self.n_users, self.n_items], dim=0
         )
-        users = torch.cat((full_users, masked_users), dim=1)
-        collaborative_items = torch.cat(
-            (full_items, masked_items), dim=1
-        )
-        if self.item_embedding_mode == 'multimodal':
+        if self.mm_propagation_mode == 'parallel':
             mm_items = self._propagate_item_graph(multimodal_items)
-            items = collaborative_items + mm_items
+            full_mm_items = None
+            masked_mm_items = None
+            final_full_items = full_items + mm_items
+            final_masked_items = masked_items + mm_items
         else:
-            mm_items = self._propagate_item_graph(collaborative_items)
-            items = collaborative_items + mm_items
+            mm_items = None
+            full_mm_items = self._propagate_item_graph(full_items)
+            masked_mm_items = self._propagate_item_graph(masked_items)
+            final_full_items = full_items + full_mm_items
+            final_masked_items = masked_items + masked_mm_items
+
+        if self.fusion == 'gated_sum':
+            users, user_fusion_gate = self._fuse_branches(
+                full_users, masked_users
+            )
+            items, item_fusion_gate = self._fuse_branches(
+                final_full_items, final_masked_items
+            )
+        else:
+            users = torch.cat((full_users, masked_users), dim=1)
+            items = torch.cat(
+                (final_full_items, final_masked_items), dim=1
+            )
+            user_fusion_gate = None
+            item_fusion_gate = None
 
         return {
             'users': users,
@@ -432,10 +501,16 @@ class MASKED_GLORIA(GeneralRecommender):
             'full_items': full_items,
             'masked_users': masked_users,
             'masked_items': masked_items,
+            'final_full_items': final_full_items,
+            'final_masked_items': final_masked_items,
             'full_preference': full_preference,
             'masked_preference': masked_preference,
             'multimodal_items': multimodal_items,
             'mm_items': mm_items,
+            'full_mm_items': full_mm_items,
+            'masked_mm_items': masked_mm_items,
+            'user_fusion_gate': user_fusion_gate,
+            'item_fusion_gate': item_fusion_gate,
             'mask': interaction_mask,
         }
 
@@ -540,12 +615,15 @@ class MASKED_GLORIA(GeneralRecommender):
         selected[selected_indices] = True
 
         forward_edges = self.edge_index[:, :self.num_interactions]
-        embedding_tables = {
-            'full_gcn.preference': self.full_gcn.preference.detach().cpu(),
-            'mask_gcn.preference': self.mask_gcn.preference.detach().cpu(),
-        }
+        embedding_tables = {}
         if self.item_embedding_mode == 'id':
             embedding_tables.update({
+                'full_gcn.preference': (
+                    self.full_gcn.preference.detach().cpu()
+                ),
+                'mask_gcn.preference': (
+                    self.mask_gcn.preference.detach().cpu()
+                ),
                 'id_embedding_full.weight': (
                     self.id_embedding_full.weight.detach().cpu()
                 ),
@@ -561,6 +639,8 @@ class MASKED_GLORIA(GeneralRecommender):
                 'text_embedding.weight': (
                     self.text_embedding.weight.detach().cpu()
                 ),
+                'user_image.weight': self.user_image.weight.detach().cpu(),
+                'user_text.weight': self.user_text.weight.detach().cpu(),
             })
 
         artifacts = {
@@ -569,9 +649,10 @@ class MASKED_GLORIA(GeneralRecommender):
                 'mask_graph_mode': 'soft',
                 'mask_degree_mode': 'full',
                 'ui_branch_mode': 'dual',
-                'ui_fusion_mode': 'concat',
+                'ui_fusion_mode': self.fusion,
                 'user_embedding_mode': 'separate',
                 'item_embedding_mode': self.item_embedding_mode,
+                'mm_propagation_mode': self.mm_propagation_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'cl_weight': self.cl_weight,
                 'cl_temperature': self.cl_temperature,
@@ -642,20 +723,57 @@ class GCN(nn.Module):
         self.has_feature = has_feature
         self.dropout = dropout
         self.device = device
+        self.uses_external_user_profile = bool(user_profile)
         self.userprofile = user_profile
         self.num_layer = num_layer
 
         preference_dim = dim_latent if has_feature else self.dim_feat
-        self.preference = nn.Parameter(
-            torch.empty(num_user, preference_dim, device=features.device)
-        )
-        nn.init.xavier_normal_(self.preference)
+        if self.uses_external_user_profile:
+            self.register_parameter('preference', None)
+        else:
+            self.preference = nn.Parameter(
+                torch.empty(num_user, preference_dim, device=features.device)
+            )
+            nn.init.xavier_normal_(self.preference)
         self.conv_embed_1 = Base_gcn(
             preference_dim, preference_dim, aggr=self.aggr_mode
         )
 
-    def forward(self, edge_index, features, edge_mask=None, edge_norm=None):
-        x = torch.cat((self.preference, features), dim=0)
+    def forward(
+        self,
+        edge_index,
+        features,
+        edge_mask=None,
+        edge_norm=None,
+        user_features=None,
+    ):
+        if self.uses_external_user_profile:
+            if user_features is None:
+                raise ValueError(
+                    'GCN requires external user_features in multimodal mode.'
+                )
+            preference = user_features
+        else:
+            if user_features is not None:
+                raise ValueError(
+                    'GCN received user_features while using its own preference.'
+                )
+            preference = self.preference
+
+        if preference.shape != (self.num_user, self.dim_feat):
+            raise ValueError(
+                'User features must have shape ({}, {}), got {}.'.format(
+                    self.num_user, self.dim_feat, tuple(preference.shape)
+                )
+            )
+        if features.shape != (self.num_item, self.dim_feat):
+            raise ValueError(
+                'Item features must have shape ({}, {}), got {}.'.format(
+                    self.num_item, self.dim_feat, tuple(features.shape)
+                )
+            )
+
+        x = torch.cat((preference, features), dim=0)
         x = F.normalize(x, p=2, dim=-1, eps=1e-12)
         h = self.conv_embed_1(
             x, edge_index, edge_mask=edge_mask, edge_norm=edge_norm
@@ -666,7 +784,7 @@ class GCN(nn.Module):
         h_2 = self.conv_embed_1(
             h_1, edge_index, edge_mask=edge_mask, edge_norm=edge_norm
         )
-        return x + h + h_1 + h_2, self.preference
+        return x + h + h_1 + h_2, preference
 
 
 class Base_gcn(nn.Module):

@@ -85,6 +85,8 @@ class MaskedGloriaTest(unittest.TestCase):
         cl_weight=0.0,
         dropout=0.2,
         item_embedding_mode='id',
+        mm_propagation_mode='sequential',
+        fusion='concat',
     ):
         return NullableConfig(
             {
@@ -105,7 +107,7 @@ class MaskedGloriaTest(unittest.TestCase):
                 'n_mm_layers': 1,
                 'mm_image_weight': image_weight,
                 'aggr_mode': 'add',
-                'fusion': 'concat',
+                'fusion': fusion,
                 'mask_keep_ratio': 0.3,
                 'mask_weight': 0.1,
                 'mask_binary_weight': 0.1,
@@ -113,6 +115,7 @@ class MaskedGloriaTest(unittest.TestCase):
                 'cl_temperature': 0.2,
                 'dropout': dropout,
                 'item_embedding_mode': item_embedding_mode,
+                'mm_propagation_mode': mm_propagation_mode,
             }
         )
 
@@ -123,6 +126,8 @@ class MaskedGloriaTest(unittest.TestCase):
         cl_weight=0.0,
         dropout=0.2,
         item_embedding_mode='id',
+        mm_propagation_mode='sequential',
+        fusion='concat',
     ):
         return MASKED_GLORIA(
             self.make_config(
@@ -131,6 +136,8 @@ class MaskedGloriaTest(unittest.TestCase):
                 cl_weight,
                 dropout,
                 item_embedding_mode,
+                mm_propagation_mode,
+                fusion,
             ),
             FakeTrainData(),
         )
@@ -294,56 +301,111 @@ class MaskedGloriaTest(unittest.TestCase):
             expected = 0.25 * image_adj.to_dense() + 0.75 * text_adj.to_dense()
             torch.testing.assert_close(model.mm_adj.to_dense(), expected)
 
-    def test_multimodal_mode_uses_features_in_ui_and_independent_ii_paths(self):
+    def test_multimodal_sequential_and_parallel_routing(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_features(root)
-            model = self.make_model(root, item_embedding_mode='multimodal')
-            representations = model._encode()
-
-            self.assertIsNone(model.id_embedding_full)
-            self.assertIsNone(model.id_embedding_masked)
-            self.assertEqual(
-                tuple(representations['multimodal_items'].shape), (4, 4)
+            parallel = self.make_model(
+                root,
+                item_embedding_mode='multimodal',
+                mm_propagation_mode='parallel',
             )
-            collaborative_items = torch.cat(
+            sequential = self.make_model(
+                root,
+                item_embedding_mode='multimodal',
+                mm_propagation_mode='sequential',
+            )
+            sequential.load_state_dict(parallel.state_dict())
+
+            parallel_rep = parallel._encode()
+            sequential_rep = sequential._encode()
+
+            self.assertIsNone(parallel.id_embedding_full)
+            self.assertIsNone(parallel.id_embedding_masked)
+            self.assertIsNone(parallel.full_gcn.preference)
+            self.assertIsNone(parallel.mask_gcn.preference)
+            self.assertEqual(tuple(parallel.user_image.weight.shape), (3, 2))
+            self.assertEqual(tuple(parallel.user_text.weight.shape), (3, 2))
+            self.assertEqual(
+                tuple(parallel_rep['multimodal_items'].shape), (4, 4)
+            )
+            self.assertEqual(tuple(parallel_rep['users'].shape), (3, 8))
+            self.assertEqual(tuple(parallel_rep['items'].shape), (4, 8))
+
+            # Both modes have identical U-I representations; only the I-I
+            # routing after those representations is changed.
+            torch.testing.assert_close(
+                parallel_rep['full_items'], sequential_rep['full_items']
+            )
+            torch.testing.assert_close(
+                parallel_rep['masked_items'], sequential_rep['masked_items']
+            )
+
+            parallel_mm = parallel._propagate_item_graph(
+                parallel_rep['multimodal_items']
+            )
+            expected_parallel = torch.cat(
                 (
-                    representations['full_items'],
-                    representations['masked_items'],
+                    parallel_rep['full_items'] + parallel_mm,
+                    parallel_rep['masked_items'] + parallel_mm,
                 ),
                 dim=1,
             )
-            expected_mm_items = model._propagate_item_graph(
-                representations['multimodal_items']
+            torch.testing.assert_close(
+                parallel_rep['mm_items'], parallel_mm
             )
             torch.testing.assert_close(
-                representations['mm_items'], expected_mm_items
-            )
-            torch.testing.assert_close(
-                representations['items'],
-                collaborative_items + expected_mm_items,
+                parallel_rep['items'], expected_parallel
             )
 
-            users_before = representations['full_users'].detach().clone()
+            full_sequential_mm = sequential._propagate_item_graph(
+                sequential_rep['full_items']
+            )
+            masked_sequential_mm = sequential._propagate_item_graph(
+                sequential_rep['masked_items']
+            )
+            expected_sequential = torch.cat(
+                (
+                    sequential_rep['full_items'] + full_sequential_mm,
+                    sequential_rep['masked_items'] + masked_sequential_mm,
+                ),
+                dim=1,
+            )
+            self.assertIsNone(sequential_rep['mm_items'])
+            torch.testing.assert_close(
+                sequential_rep['full_mm_items'], full_sequential_mm
+            )
+            torch.testing.assert_close(
+                sequential_rep['masked_mm_items'], masked_sequential_mm
+            )
+            torch.testing.assert_close(
+                sequential_rep['items'], expected_sequential
+            )
+
+            users_before = parallel_rep['full_users'].detach().clone()
             with torch.no_grad():
-                model.image_embedding.weight[0].mul_(-1.0)
-            users_after = model._encode()['full_users']
+                parallel.image_embedding.weight[0].mul_(-1.0)
+            users_after = parallel._encode()['full_users']
             self.assertFalse(torch.allclose(users_before, users_after))
 
-            loss = model.calculate_loss(self.training_interaction())
+            loss = parallel.calculate_loss(self.training_interaction())
             loss.backward()
             for parameter in (
-                model.image_embedding.weight,
-                model.text_embedding.weight,
-                model.image_trs.weight,
-                model.text_trs.weight,
-                model.multimodal_ui_fusion.weight,
+                parallel.image_embedding.weight,
+                parallel.text_embedding.weight,
+                parallel.image_trs.weight,
+                parallel.text_trs.weight,
+                parallel.user_image.weight,
+                parallel.user_text.weight,
             ):
                 self.assertIsNotNone(parameter.grad)
                 self.assertTrue(torch.isfinite(parameter.grad).all())
 
-            artifacts = model.get_analysis_artifacts()
+            artifacts = parallel.get_analysis_artifacts()
             self.assertEqual(
                 artifacts['metadata']['item_embedding_mode'], 'multimodal'
+            )
+            self.assertEqual(
+                artifacts['metadata']['mm_propagation_mode'], 'parallel'
             )
             self.assertIn(
                 'image_embedding.weight', artifacts['embedding_tables']
@@ -351,15 +413,124 @@ class MaskedGloriaTest(unittest.TestCase):
             self.assertIn(
                 'text_embedding.weight', artifacts['embedding_tables']
             )
+            self.assertIn('user_image.weight', artifacts['embedding_tables'])
+            self.assertIn('user_text.weight', artifacts['embedding_tables'])
 
-            expected = model._encode()
+            expected = parallel._encode()
             restored = self.make_model(
-                root, item_embedding_mode='multimodal'
+                root,
+                item_embedding_mode='multimodal',
+                mm_propagation_mode='parallel',
             )
-            restored.load_state_dict(model.state_dict())
+            restored.load_state_dict(parallel.state_dict())
             actual = restored._encode()
             torch.testing.assert_close(actual['users'], expected['users'])
             torch.testing.assert_close(actual['items'], expected['items'])
+
+    def test_sequential_gated_sum_fuses_users_and_post_ii_items(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                item_embedding_mode='multimodal',
+                mm_propagation_mode='sequential',
+                fusion='gated_sum',
+            )
+            representations = model._encode()
+
+            # d=2 per modality, so each branch and both final tables are 2d=4.
+            self.assertEqual(model.branch_embedding_dim, 4)
+            self.assertEqual(model.final_embedding_dim, 4)
+            self.assertEqual(tuple(representations['users'].shape), (3, 4))
+            self.assertEqual(tuple(representations['items'].shape), (4, 4))
+
+            expected_full_items = (
+                representations['full_items']
+                + model._propagate_item_graph(
+                    representations['full_items']
+                )
+            )
+            expected_masked_items = (
+                representations['masked_items']
+                + model._propagate_item_graph(
+                    representations['masked_items']
+                )
+            )
+            item_gate = torch.sigmoid(
+                model.fusion_gate(
+                    torch.cat(
+                        (expected_full_items, expected_masked_items), dim=1
+                    )
+                )
+            )
+            expected_items = (
+                item_gate * expected_full_items
+                + (1.0 - item_gate) * expected_masked_items
+            )
+            torch.testing.assert_close(
+                representations['item_fusion_gate'], item_gate
+            )
+            torch.testing.assert_close(
+                representations['items'], expected_items
+            )
+
+            user_gate = torch.sigmoid(
+                model.fusion_gate(
+                    torch.cat(
+                        (
+                            representations['full_users'],
+                            representations['masked_users'],
+                        ),
+                        dim=1,
+                    )
+                )
+            )
+            expected_users = (
+                user_gate * representations['full_users']
+                + (1.0 - user_gate) * representations['masked_users']
+            )
+            torch.testing.assert_close(
+                representations['user_fusion_gate'], user_gate
+            )
+            torch.testing.assert_close(
+                representations['users'], expected_users
+            )
+
+            loss = model.calculate_loss(self.training_interaction())
+            loss.backward()
+            self.assertIsNotNone(model.fusion_gate.weight.grad)
+            self.assertTrue(
+                torch.isfinite(model.fusion_gate.weight.grad).all()
+            )
+            scores = model.full_sort_predict((torch.tensor([0, 1]),))
+            self.assertEqual(tuple(scores.shape), (2, 4))
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['ui_fusion_mode'], 'gated_sum'
+            )
+            self.assertIn(
+                'user_fusion_gate', artifacts['representations']
+            )
+            self.assertIn(
+                'item_fusion_gate', artifacts['representations']
+            )
+
+            restored = self.make_model(
+                root,
+                item_embedding_mode='multimodal',
+                mm_propagation_mode='sequential',
+                fusion='gated_sum',
+            )
+            restored.load_state_dict(model.state_dict())
+            restored_rep = restored._encode()
+            expected_rep = model._encode()
+            torch.testing.assert_close(
+                restored_rep['users'], expected_rep['users']
+            )
+            torch.testing.assert_close(
+                restored_rep['items'], expected_rep['items']
+            )
 
     def test_valid_cache_is_reused_and_stale_cache_is_rebuilt(self):
         with tempfile.TemporaryDirectory() as root:
