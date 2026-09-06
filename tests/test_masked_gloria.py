@@ -80,7 +80,11 @@ class MaskedGloriaTest(unittest.TestCase):
 
     @staticmethod
     def make_config(
-        root, image_weight=0.25, cl_weight=0.0, dropout=0.2
+        root,
+        image_weight=0.25,
+        cl_weight=0.0,
+        dropout=0.2,
+        item_embedding_mode='id',
     ):
         return NullableConfig(
             {
@@ -108,14 +112,26 @@ class MaskedGloriaTest(unittest.TestCase):
                 'cl_weight': cl_weight,
                 'cl_temperature': 0.2,
                 'dropout': dropout,
+                'item_embedding_mode': item_embedding_mode,
             }
         )
 
     def make_model(
-        self, root, image_weight=0.25, cl_weight=0.0, dropout=0.2
+        self,
+        root,
+        image_weight=0.25,
+        cl_weight=0.0,
+        dropout=0.2,
+        item_embedding_mode='id',
     ):
         return MASKED_GLORIA(
-            self.make_config(root, image_weight, cl_weight, dropout),
+            self.make_config(
+                root,
+                image_weight,
+                cl_weight,
+                dropout,
+                item_embedding_mode,
+            ),
             FakeTrainData(),
         )
 
@@ -277,6 +293,73 @@ class MaskedGloriaTest(unittest.TestCase):
             _, text_adj = model.get_knn_adj_mat(model.t_feat)
             expected = 0.25 * image_adj.to_dense() + 0.75 * text_adj.to_dense()
             torch.testing.assert_close(model.mm_adj.to_dense(), expected)
+
+    def test_multimodal_mode_uses_features_in_ui_and_independent_ii_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root, item_embedding_mode='multimodal')
+            representations = model._encode()
+
+            self.assertIsNone(model.id_embedding_full)
+            self.assertIsNone(model.id_embedding_masked)
+            self.assertEqual(
+                tuple(representations['multimodal_items'].shape), (4, 4)
+            )
+            collaborative_items = torch.cat(
+                (
+                    representations['full_items'],
+                    representations['masked_items'],
+                ),
+                dim=1,
+            )
+            expected_mm_items = model._propagate_item_graph(
+                representations['multimodal_items']
+            )
+            torch.testing.assert_close(
+                representations['mm_items'], expected_mm_items
+            )
+            torch.testing.assert_close(
+                representations['items'],
+                collaborative_items + expected_mm_items,
+            )
+
+            users_before = representations['full_users'].detach().clone()
+            with torch.no_grad():
+                model.image_embedding.weight[0].mul_(-1.0)
+            users_after = model._encode()['full_users']
+            self.assertFalse(torch.allclose(users_before, users_after))
+
+            loss = model.calculate_loss(self.training_interaction())
+            loss.backward()
+            for parameter in (
+                model.image_embedding.weight,
+                model.text_embedding.weight,
+                model.image_trs.weight,
+                model.text_trs.weight,
+                model.multimodal_ui_fusion.weight,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['item_embedding_mode'], 'multimodal'
+            )
+            self.assertIn(
+                'image_embedding.weight', artifacts['embedding_tables']
+            )
+            self.assertIn(
+                'text_embedding.weight', artifacts['embedding_tables']
+            )
+
+            expected = model._encode()
+            restored = self.make_model(
+                root, item_embedding_mode='multimodal'
+            )
+            restored.load_state_dict(model.state_dict())
+            actual = restored._encode()
+            torch.testing.assert_close(actual['users'], expected['users'])
+            torch.testing.assert_close(actual['items'], expected['items'])
 
     def test_valid_cache_is_reused_and_stale_cache_is_rebuilt(self):
         with tempfile.TemporaryDirectory() as root:

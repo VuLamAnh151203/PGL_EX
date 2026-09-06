@@ -1,11 +1,12 @@
 """Multimodal, memory-safe MASKED_GLORIA for the PGL pipeline.
 
-This implementation keeps the original GLORIA layout: two independent
-ID-embedding user-item branches (full and softly masked), three propagation
-steps summed with the initial embeddings, concatenation of both branches,
-and item-only propagation on a feature-derived graph.  The item graph fuses
-visual and textual kNN graphs, while edge-index propagation avoids dense
-``(n_users + n_items) ** 2`` gradients for the learnable interaction mask.
+This implementation keeps the original GLORIA full and softly masked
+user-item branches, three propagation steps summed with the initial
+embeddings, and concatenation of both branches. ``id`` mode retains the
+original ID-only branch inputs. ``multimodal`` mode feeds projected visual
+and textual features into both U-I branches and through an independent I-I
+path. Edge-index propagation avoids dense ``(n_users + n_items) ** 2``
+gradients for the learnable interaction mask.
 """
 
 import math
@@ -53,6 +54,9 @@ class MASKED_GLORIA(GeneralRecommender):
             _config_value(config, 'cl_temperature', 0.2)
         )
         self.cl_dropout = float(_config_value(config, 'dropout', 0.2))
+        self.item_embedding_mode = str(
+            _config_value(config, 'item_embedding_mode', 'id')
+        ).lower()
         self.aggr_mode = str(_config_value(config, 'aggr_mode', 'add')).lower()
         self.fusion = str(_config_value(config, 'fusion', 'concat')).lower()
 
@@ -78,6 +82,10 @@ class MASKED_GLORIA(GeneralRecommender):
             raise ValueError('cl_temperature must be positive.')
         if not 0.0 <= self.cl_dropout < 1.0:
             raise ValueError('dropout must be in the interval [0, 1).')
+        if self.item_embedding_mode not in {'id', 'multimodal'}:
+            raise ValueError(
+                "item_embedding_mode must be either 'id' or 'multimodal'."
+            )
         if self.aggr_mode != 'add':
             raise ValueError("MASKED_GLORIA only supports aggr_mode='add'.")
         if self.fusion != 'concat':
@@ -139,14 +147,52 @@ class MASKED_GLORIA(GeneralRecommender):
             )
         )
 
-        self.id_embedding_full = nn.Embedding(
-            self.n_items, self.feat_embed_dim
-        )
-        self.id_embedding_masked = nn.Embedding(
-            self.n_items, self.feat_embed_dim
-        )
-        nn.init.xavier_uniform_(self.id_embedding_full.weight)
-        nn.init.xavier_uniform_(self.id_embedding_masked.weight)
+        if self.item_embedding_mode == 'id':
+            self.id_embedding_full = nn.Embedding(
+                self.n_items, self.feat_embed_dim
+            )
+            self.id_embedding_masked = nn.Embedding(
+                self.n_items, self.feat_embed_dim
+            )
+            nn.init.xavier_uniform_(self.id_embedding_full.weight)
+            nn.init.xavier_uniform_(self.id_embedding_masked.weight)
+            self.image_embedding = None
+            self.text_embedding = None
+            self.image_trs = None
+            self.text_trs = None
+            self.multimodal_ui_fusion = None
+            full_gcn_features = self.id_embedding_full.weight
+            masked_gcn_features = self.id_embedding_masked.weight
+        else:
+            self.id_embedding_full = None
+            self.id_embedding_masked = None
+            self.image_embedding = nn.Embedding.from_pretrained(
+                self.v_feat, freeze=False
+            )
+            self.text_embedding = nn.Embedding.from_pretrained(
+                self.t_feat, freeze=False
+            )
+            self.image_trs = nn.Linear(
+                self.v_feat.size(1), self.feat_embed_dim
+            )
+            self.text_trs = nn.Linear(
+                self.t_feat.size(1), self.feat_embed_dim
+            )
+            self.multimodal_ui_fusion = nn.Linear(
+                2 * self.feat_embed_dim, self.feat_embed_dim
+            )
+            for projection in (
+                self.image_trs,
+                self.text_trs,
+                self.multimodal_ui_fusion,
+            ):
+                nn.init.xavier_uniform_(projection.weight)
+                nn.init.zeros_(projection.bias)
+            feature_template = self.v_feat.new_empty(
+                (self.n_items, self.feat_embed_dim)
+            )
+            full_gcn_features = feature_template
+            masked_gcn_features = feature_template
 
         gcn_kwargs = {
             'datasets': dataset,
@@ -162,10 +208,10 @@ class MASKED_GLORIA(GeneralRecommender):
             'device': self.device,
         }
         self.full_gcn = GCN(
-            features=self.id_embedding_full.weight, **gcn_kwargs
+            features=full_gcn_features, **gcn_kwargs
         )
         self.mask_gcn = GCN(
-            features=self.id_embedding_masked.weight, **gcn_kwargs
+            features=masked_gcn_features, **gcn_kwargs
         )
 
         mm_adj = self._build_or_load_mm_graph(config)
@@ -305,15 +351,51 @@ class MASKED_GLORIA(GeneralRecommender):
         return np.column_stack((rows, cols))
 
     def item_item(self, rep):
+        return rep + self._propagate_item_graph(rep)
+
+    def _propagate_item_graph(self, rep):
         propagated = rep
         for _ in range(self.n_layers):
             propagated = torch.sparse.mm(self.mm_adj, propagated)
-        return rep + propagated
+        return propagated
+
+    def _multimodal_item_embeddings(self):
+        image_features = F.normalize(
+            self.image_trs(self.image_embedding.weight),
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+        text_features = F.normalize(
+            self.text_trs(self.text_embedding.weight),
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+        multimodal_items = torch.cat(
+            (image_features, text_features), dim=1
+        )
+        ui_items = F.normalize(
+            self.multimodal_ui_fusion(multimodal_items),
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+        return ui_items, multimodal_items
 
     def _encode(self):
+        if self.item_embedding_mode == 'multimodal':
+            ui_items, multimodal_items = self._multimodal_item_embeddings()
+            full_initial_items = ui_items
+            masked_initial_items = ui_items
+        else:
+            multimodal_items = None
+            full_initial_items = self.id_embedding_full.weight
+            masked_initial_items = self.id_embedding_masked.weight
+
         full_rep, full_preference = self.full_gcn(
             self.edge_index,
-            self.id_embedding_full.weight,
+            full_initial_items,
             edge_norm=self.full_edge_norm,
         )
 
@@ -321,7 +403,7 @@ class MASKED_GLORIA(GeneralRecommender):
         edge_mask = torch.cat((interaction_mask, interaction_mask), dim=0)
         masked_rep, masked_preference = self.mask_gcn(
             self.edge_index,
-            self.id_embedding_masked.weight,
+            masked_initial_items,
             edge_mask=edge_mask,
             edge_norm=self.full_edge_norm,
         )
@@ -336,7 +418,12 @@ class MASKED_GLORIA(GeneralRecommender):
         collaborative_items = torch.cat(
             (full_items, masked_items), dim=1
         )
-        items = self.item_item(collaborative_items)
+        if self.item_embedding_mode == 'multimodal':
+            mm_items = self._propagate_item_graph(multimodal_items)
+            items = collaborative_items + mm_items
+        else:
+            mm_items = self._propagate_item_graph(collaborative_items)
+            items = collaborative_items + mm_items
 
         return {
             'users': users,
@@ -347,6 +434,8 @@ class MASKED_GLORIA(GeneralRecommender):
             'masked_items': masked_items,
             'full_preference': full_preference,
             'masked_preference': masked_preference,
+            'multimodal_items': multimodal_items,
+            'mm_items': mm_items,
             'mask': interaction_mask,
         }
 
@@ -451,6 +540,29 @@ class MASKED_GLORIA(GeneralRecommender):
         selected[selected_indices] = True
 
         forward_edges = self.edge_index[:, :self.num_interactions]
+        embedding_tables = {
+            'full_gcn.preference': self.full_gcn.preference.detach().cpu(),
+            'mask_gcn.preference': self.mask_gcn.preference.detach().cpu(),
+        }
+        if self.item_embedding_mode == 'id':
+            embedding_tables.update({
+                'id_embedding_full.weight': (
+                    self.id_embedding_full.weight.detach().cpu()
+                ),
+                'id_embedding_masked.weight': (
+                    self.id_embedding_masked.weight.detach().cpu()
+                ),
+            })
+        else:
+            embedding_tables.update({
+                'image_embedding.weight': (
+                    self.image_embedding.weight.detach().cpu()
+                ),
+                'text_embedding.weight': (
+                    self.text_embedding.weight.detach().cpu()
+                ),
+            })
+
         artifacts = {
             'metadata': {
                 'model': self.__class__.__name__,
@@ -459,6 +571,7 @@ class MASKED_GLORIA(GeneralRecommender):
                 'ui_branch_mode': 'dual',
                 'ui_fusion_mode': 'concat',
                 'user_embedding_mode': 'separate',
+                'item_embedding_mode': self.item_embedding_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'cl_weight': self.cl_weight,
                 'cl_temperature': self.cl_temperature,
@@ -482,20 +595,7 @@ class MASKED_GLORIA(GeneralRecommender):
                     'selected_at_keep_ratio': selected.detach().cpu(),
                 }
             },
-            'embedding_tables': {
-                'id_embedding_full.weight': (
-                    self.id_embedding_full.weight.detach().cpu()
-                ),
-                'id_embedding_masked.weight': (
-                    self.id_embedding_masked.weight.detach().cpu()
-                ),
-                'full_gcn.preference': (
-                    self.full_gcn.preference.detach().cpu()
-                ),
-                'mask_gcn.preference': (
-                    self.mask_gcn.preference.detach().cpu()
-                ),
-            },
+            'embedding_tables': embedding_tables,
             'representations': {
                 key: value.detach().cpu()
                 for key, value in representations.items()

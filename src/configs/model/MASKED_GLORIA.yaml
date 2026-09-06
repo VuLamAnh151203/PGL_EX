@@ -9,6 +9,11 @@ n_mm_layers: 1
 knn_k: 10
 mm_image_weight: 0.1
 
+# id: multimodal features only define the I-I graph.
+# multimodal: projected image/text features enter both U-I branches and also
+# follow an independent I-I path before being added to the final item.
+item_embedding_mode: multimodal
+
 # GLORIA keeps additive message aggregation and concatenates its two U-I
 # branches. Other modes are intentionally unsupported in this implementation.
 aggr_mode: add
