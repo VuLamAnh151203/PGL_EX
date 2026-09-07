@@ -67,6 +67,9 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mask_graph_mode = str(
             _config_value(config, 'mask_graph_mode', 'hard')
         ).lower()
+        self.mask_sharing_mode = str(
+            _config_value(config, 'mask_sharing_mode', 'separate')
+        ).lower()
         self.mask_degree_mode = str(
             _config_value(config, 'mask_degree_mode', 'full')
         ).lower()
@@ -98,6 +101,10 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('dropout must be in [0, 1).')
         if self.mask_graph_mode not in {'soft', 'hard'}:
             raise ValueError("mask_graph_mode must be 'soft' or 'hard'.")
+        if self.mask_sharing_mode not in {'shared', 'separate'}:
+            raise ValueError(
+                "mask_sharing_mode must be 'shared' or 'separate'."
+            )
         if self.mask_degree_mode not in {'full', 'masked'}:
             raise ValueError(
                 "mask_degree_mode must be 'full' or 'masked'."
@@ -164,24 +171,22 @@ class DUAL_MODALITY(GeneralRecommender):
         initial_logit = math.log(
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
-        self.image_mask_logits = nn.Parameter(
-            torch.full(
-                (self.num_interactions,),
-                initial_logit,
-                dtype=torch.float32,
-                device=self.device,
-            )
+        mask_template = torch.full(
+            (self.num_interactions,),
+            initial_logit,
+            dtype=torch.float32,
+            device=self.device,
         )
-        self.text_mask_logits = nn.Parameter(
-            torch.full(
-                (self.num_interactions,),
-                initial_logit,
-                dtype=torch.float32,
-                device=self.device,
-            )
-        )
+        if self.mask_sharing_mode == 'shared':
+            self.shared_mask_logits = nn.Parameter(mask_template)
+            self.register_parameter('image_mask_logits', None)
+            self.register_parameter('text_mask_logits', None)
+        else:
+            self.register_parameter('shared_mask_logits', None)
+            self.image_mask_logits = nn.Parameter(mask_template.clone())
+            self.text_mask_logits = nn.Parameter(mask_template.clone())
 
-        for modality in ('image', 'text'):
+        for modality in ('shared', 'image', 'text'):
             for split in ('train', 'eval'):
                 self.register_buffer(
                     '{}_hard_{}_indices'.format(modality, split),
@@ -355,21 +360,31 @@ class DUAL_MODALITY(GeneralRecommender):
 
     def pre_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
-            self.image_hard_train_indices = self._sample_hard_indices(
-                self.image_mask_logits
-            )
-            self.text_hard_train_indices = self._sample_hard_indices(
-                self.text_mask_logits
-            )
+            if self.mask_sharing_mode == 'shared':
+                self.shared_hard_train_indices = self._sample_hard_indices(
+                    self.shared_mask_logits
+                )
+            else:
+                self.image_hard_train_indices = self._sample_hard_indices(
+                    self.image_mask_logits
+                )
+                self.text_hard_train_indices = self._sample_hard_indices(
+                    self.text_mask_logits
+                )
 
     def post_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
-            self.image_hard_eval_indices = self._select_hard_indices(
-                self.image_mask_logits
-            )
-            self.text_hard_eval_indices = self._select_hard_indices(
-                self.text_mask_logits
-            )
+            if self.mask_sharing_mode == 'shared':
+                self.shared_hard_eval_indices = self._select_hard_indices(
+                    self.shared_mask_logits
+                )
+            else:
+                self.image_hard_eval_indices = self._select_hard_indices(
+                    self.image_mask_logits
+                )
+                self.text_hard_eval_indices = self._select_hard_indices(
+                    self.text_mask_logits
+                )
 
     def _normalize_adj_m(self, indices, adj_size, edge_weights=None):
         if edge_weights is None:
@@ -406,7 +421,26 @@ class DUAL_MODALITY(GeneralRecommender):
         )
         return edges, values
 
+    def _get_mask_logits(self, modality):
+        if self.mask_sharing_mode == 'shared':
+            return self.shared_mask_logits
+        if modality == 'image':
+            return self.image_mask_logits
+        if modality == 'text':
+            return self.text_mask_logits
+        raise ValueError("modality must be 'image' or 'text'.")
+
+    def _unique_mask_logits(self):
+        if self.mask_sharing_mode == 'shared':
+            return (('shared', self.shared_mask_logits),)
+        return (
+            ('image', self.image_mask_logits),
+            ('text', self.text_mask_logits),
+        )
+
     def _current_hard_indices(self, modality, mask_logits):
+        if self.mask_sharing_mode == 'shared':
+            modality = 'shared'
         split = 'train' if self.training else 'eval'
         buffer_name = '{}_hard_{}_indices'.format(modality, split)
         indices = getattr(self, buffer_name)
@@ -593,10 +627,10 @@ class DUAL_MODALITY(GeneralRecommender):
         )
 
         image_masked_adj, image_mask = self._masked_ui_adjacency(
-            'image', self.image_mask_logits
+            'image', self._get_mask_logits('image')
         )
         text_masked_adj, text_mask = self._masked_ui_adjacency(
-            'text', self.text_mask_logits
+            'text', self._get_mask_logits('text')
         )
         image_full = self._propagate_ui_graph(
             adj, image_full_initial, self.n_ui_layers
@@ -719,7 +753,7 @@ class DUAL_MODALITY(GeneralRecommender):
 
         mask_losses = []
         mask_means = []
-        for mask_logits in (self.image_mask_logits, self.text_mask_logits):
+        for _, mask_logits in self._unique_mask_logits():
             probabilities = torch.sigmoid(mask_logits)
             mask_mean = probabilities.mean()
             budget_loss = (mask_mean - self.mask_keep_ratio).pow(2)
@@ -760,10 +794,7 @@ class DUAL_MODALITY(GeneralRecommender):
         representations = self.latest_representations
 
         masks = {}
-        for modality, logits in (
-            ('image', self.image_mask_logits),
-            ('text', self.text_mask_logits),
-        ):
+        for modality, logits in self._unique_mask_logits():
             selected_indices = self._select_hard_indices(logits)
             selected = torch.zeros_like(logits, dtype=torch.bool)
             selected[selected_indices] = True
@@ -778,6 +809,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'model': self.__class__.__name__,
                 'ui_branch_mode': 'four_branch_dual_modality',
                 'mask_graph_mode': self.mask_graph_mode,
+                'mask_sharing_mode': self.mask_sharing_mode,
                 'mask_degree_mode': self.mask_degree_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'n_ui_layers': self.n_ui_layers,

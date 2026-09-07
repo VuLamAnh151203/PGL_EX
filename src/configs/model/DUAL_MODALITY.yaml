@@ -10,7 +10,11 @@ n_mm_layers: 1
 knn_k: 10
 mm_image_weight: 0.1
 
-# Each modality has a full and an independently masked U-I branch.
+# shared: image/text masked branches use one theta_ui and the same edge mask.
+# separate: each modality learns its own mask parameter.
+mask_sharing_mode: shared
+
+# Each modality has a full and a masked U-I branch.
 mask_graph_mode: hard
 mask_degree_mode: full
 mask_keep_ratio: 0.3

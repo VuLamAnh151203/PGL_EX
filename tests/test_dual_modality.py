@@ -79,7 +79,12 @@ class DualModalityTest(unittest.TestCase):
         )
 
     @staticmethod
-    def make_config(root, cl_weight=0.0, mask_graph_mode='hard'):
+    def make_config(
+        root,
+        cl_weight=0.0,
+        mask_graph_mode='hard',
+        mask_sharing_mode='separate',
+    ):
         return NullableConfig(
             {
                 'USER_ID_FIELD': 'user_id',
@@ -99,6 +104,7 @@ class DualModalityTest(unittest.TestCase):
                 'n_mm_layers': 1,
                 'n_ui_layers': 2,
                 'mm_image_weight': 0.25,
+                'mask_sharing_mode': mask_sharing_mode,
                 'mask_graph_mode': mask_graph_mode,
                 'mask_degree_mode': 'full',
                 'mask_keep_ratio': 0.3,
@@ -111,9 +117,20 @@ class DualModalityTest(unittest.TestCase):
             }
         )
 
-    def make_model(self, root, cl_weight=0.0, mask_graph_mode='hard'):
+    def make_model(
+        self,
+        root,
+        cl_weight=0.0,
+        mask_graph_mode='hard',
+        mask_sharing_mode='separate',
+    ):
         return DUAL_MODALITY(
-            self.make_config(root, cl_weight, mask_graph_mode),
+            self.make_config(
+                root,
+                cl_weight,
+                mask_graph_mode,
+                mask_sharing_mode,
+            ),
             FakeTrainData(),
         )
 
@@ -197,6 +214,79 @@ class DualModalityTest(unittest.TestCase):
                 image_adj._nnz(), 2 * model.hard_keep_count
             )
             self.assertEqual(text_adj._nnz(), 2 * model.hard_keep_count)
+
+    def test_shared_mask_uses_one_parameter_and_one_edge_selection(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root, mask_sharing_mode='shared')
+
+            mask_parameters = {
+                name: parameter
+                for name, parameter in model.named_parameters()
+                if 'mask_logits' in name
+            }
+            self.assertEqual(set(mask_parameters), {'shared_mask_logits'})
+            self.assertIsNone(model.image_mask_logits)
+            self.assertIsNone(model.text_mask_logits)
+            self.assertIs(
+                model._get_mask_logits('image'),
+                model._get_mask_logits('text'),
+            )
+
+            model.pre_epoch_processing()
+            image_adj, image_mask = model._masked_ui_adjacency(
+                'image', model._get_mask_logits('image')
+            )
+            text_adj, text_mask = model._masked_ui_adjacency(
+                'text', model._get_mask_logits('text')
+            )
+            self.assertEqual(
+                model.shared_hard_train_indices.numel(),
+                model.hard_keep_count,
+            )
+            torch.testing.assert_close(
+                image_adj.coalesce().indices(),
+                text_adj.coalesce().indices(),
+            )
+            torch.testing.assert_close(
+                image_adj.coalesce().values(),
+                text_adj.coalesce().values(),
+            )
+            torch.testing.assert_close(image_mask, text_mask)
+
+            loss = model.calculate_loss(self.interaction())
+            loss.backward()
+            self.assertIsNotNone(model.shared_mask_logits.grad)
+            self.assertTrue(
+                torch.isfinite(model.shared_mask_logits.grad).all()
+            )
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['mask_sharing_mode'], 'shared'
+            )
+            self.assertEqual(set(artifacts['masks']), {'shared'})
+
+            soft_model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_sharing_mode='shared',
+            )
+            image_adj, image_mask = soft_model._masked_ui_adjacency(
+                'image', soft_model._get_mask_logits('image')
+            )
+            text_adj, text_mask = soft_model._masked_ui_adjacency(
+                'text', soft_model._get_mask_logits('text')
+            )
+            torch.testing.assert_close(image_mask, text_mask)
+            torch.testing.assert_close(
+                image_adj.coalesce().indices(),
+                text_adj.coalesce().indices(),
+            )
+            torch.testing.assert_close(
+                image_adj.coalesce().values(),
+                text_adj.coalesce().values(),
+            )
 
     def test_loss_gradients_cl_switch_and_input_immutability(self):
         with tempfile.TemporaryDirectory() as root:
