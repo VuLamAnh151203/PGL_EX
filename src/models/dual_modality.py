@@ -4,8 +4,8 @@ DUAL_MODALITY
 
 Four-branch extension of PGL with modality-specific interaction masks:
 image-full, image-masked, text-full, and text-masked. Full/masked outputs
-are fused inside each modality, then image/text are concatenated exactly as
-in PGL. The multimodal I-I path remains parallel to U-I propagation.
+can be fused by separate modality gates or by one joint gate after image/text
+concatenation. The multimodal I-I path remains parallel to U-I propagation.
 
 The public method layout intentionally follows ``models/pgl.py`` so the
 model remains easy to compare with the original implementation.
@@ -70,6 +70,9 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mask_sharing_mode = str(
             _config_value(config, 'mask_sharing_mode', 'separate')
         ).lower()
+        self.fusion_gate_mode = str(
+            _config_value(config, 'fusion_gate_mode', 'separate')
+        ).lower()
         self.mask_degree_mode = str(
             _config_value(config, 'mask_degree_mode', 'full')
         ).lower()
@@ -104,6 +107,10 @@ class DUAL_MODALITY(GeneralRecommender):
         if self.mask_sharing_mode not in {'shared', 'separate'}:
             raise ValueError(
                 "mask_sharing_mode must be 'shared' or 'separate'."
+            )
+        if self.fusion_gate_mode not in {'shared', 'separate'}:
+            raise ValueError(
+                "fusion_gate_mode must be 'shared' or 'separate'."
             )
         if self.mask_degree_mode not in {'full', 'masked'}:
             raise ValueError(
@@ -223,18 +230,28 @@ class DUAL_MODALITY(GeneralRecommender):
             self.t_feat.size(1), self.feat_embed_dim
         )
 
-        self.image_fusion_gate = nn.Linear(
-            2 * self.embedding_dim, self.embedding_dim
-        )
-        self.text_fusion_gate = nn.Linear(
-            2 * self.embedding_dim, self.embedding_dim
-        )
-        for fusion_gate in (
-            self.image_fusion_gate,
-            self.text_fusion_gate,
-        ):
-            nn.init.xavier_uniform_(fusion_gate.weight)
-            nn.init.zeros_(fusion_gate.bias)
+        if self.fusion_gate_mode == 'shared':
+            self.shared_fusion_gate = nn.Linear(
+                4 * self.embedding_dim, 2 * self.embedding_dim
+            )
+            self.image_fusion_gate = None
+            self.text_fusion_gate = None
+            nn.init.xavier_uniform_(self.shared_fusion_gate.weight)
+            nn.init.zeros_(self.shared_fusion_gate.bias)
+        else:
+            self.shared_fusion_gate = None
+            self.image_fusion_gate = nn.Linear(
+                2 * self.embedding_dim, self.embedding_dim
+            )
+            self.text_fusion_gate = nn.Linear(
+                2 * self.embedding_dim, self.embedding_dim
+            )
+            for fusion_gate in (
+                self.image_fusion_gate,
+                self.text_fusion_gate,
+            ):
+                nn.init.xavier_uniform_(fusion_gate.weight)
+                nn.init.zeros_(fusion_gate.bias)
 
         mm_adj = self._build_or_load_mm_graph(config)
         self.register_buffer('mm_adj', mm_adj.coalesce())
@@ -535,6 +552,43 @@ class DUAL_MODALITY(GeneralRecommender):
         )
         return fused, gate
 
+    def _fuse_full_masked_modalities(
+        self,
+        image_full,
+        image_masked,
+        text_full,
+        text_masked,
+    ):
+        if self.fusion_gate_mode == 'shared':
+            full_embeddings = torch.cat((image_full, text_full), dim=1)
+            masked_embeddings = torch.cat(
+                (image_masked, text_masked), dim=1
+            )
+            fused, shared_gate = self._gated_sum(
+                full_embeddings,
+                masked_embeddings,
+                self.shared_fusion_gate,
+            )
+            image_gate, text_gate = torch.split(
+                shared_gate,
+                [self.embedding_dim, self.embedding_dim],
+                dim=1,
+            )
+            return fused, image_gate, text_gate, shared_gate
+
+        image_embeddings, image_gate = self._gated_sum(
+            image_full,
+            image_masked,
+            self.image_fusion_gate,
+        )
+        text_embeddings, text_gate = self._gated_sum(
+            text_full,
+            text_masked,
+            self.text_fusion_gate,
+        )
+        fused = torch.cat((image_embeddings, text_embeddings), dim=1)
+        return fused, image_gate, text_gate, None
+
     def _mm_cache_metadata(self, config):
         return {
             'version': self.MM_CACHE_VERSION,
@@ -658,29 +712,36 @@ class DUAL_MODALITY(GeneralRecommender):
             text_masked, [self.n_users, self.n_items], dim=0
         )
 
-        image_users, image_user_gate = self._gated_sum(
-            image_full_users,
-            image_masked_users,
-            self.image_fusion_gate,
+        user_embeddings, image_user_gate, text_user_gate, shared_user_gate = (
+            self._fuse_full_masked_modalities(
+                image_full_users,
+                image_masked_users,
+                text_full_users,
+                text_masked_users,
+            )
         )
-        image_items, image_item_gate = self._gated_sum(
-            image_full_items,
-            image_masked_items,
-            self.image_fusion_gate,
-        )
-        text_users, text_user_gate = self._gated_sum(
-            text_full_users,
-            text_masked_users,
-            self.text_fusion_gate,
-        )
-        text_items, text_item_gate = self._gated_sum(
-            text_full_items,
-            text_masked_items,
-            self.text_fusion_gate,
+        ui_item_embeddings, image_item_gate, text_item_gate, shared_item_gate = (
+            self._fuse_full_masked_modalities(
+                image_full_items,
+                image_masked_items,
+                text_full_items,
+                text_masked_items,
+            )
         )
 
-        user_embeddings = torch.cat((image_users, text_users), dim=1)
-        ui_item_embeddings = torch.cat((image_items, text_items), dim=1)
+        full_user_embeddings = torch.cat(
+            (image_full_users, text_full_users), dim=1
+        )
+        masked_user_embeddings = torch.cat(
+            (image_masked_users, text_masked_users), dim=1
+        )
+        full_item_embeddings = torch.cat(
+            (image_full_items, text_full_items), dim=1
+        )
+        masked_item_embeddings = torch.cat(
+            (image_masked_items, text_masked_items), dim=1
+        )
+
         item_embeddings = torch.cat((image_feats, text_feats), dim=1)
         mm_item_embeddings = item_embeddings
         for _ in range(self.n_layers):
@@ -694,6 +755,10 @@ class DUAL_MODALITY(GeneralRecommender):
             'items': final_item_embeddings,
             'ui_items': ui_item_embeddings,
             'mm_items': mm_item_embeddings,
+            'full_users': full_user_embeddings,
+            'masked_users': masked_user_embeddings,
+            'full_items': full_item_embeddings,
+            'masked_items': masked_item_embeddings,
             'image_full_users': image_full_users,
             'image_full_items': image_full_items,
             'image_masked_users': image_masked_users,
@@ -706,6 +771,8 @@ class DUAL_MODALITY(GeneralRecommender):
             'image_item_gate': image_item_gate,
             'text_user_gate': text_user_gate,
             'text_item_gate': text_item_gate,
+            'shared_user_gate': shared_user_gate,
+            'shared_item_gate': shared_item_gate,
             'image_mask': image_mask,
             'text_mask': text_mask,
         }
@@ -810,6 +877,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'ui_branch_mode': 'four_branch_dual_modality',
                 'mask_graph_mode': self.mask_graph_mode,
                 'mask_sharing_mode': self.mask_sharing_mode,
+                'fusion_gate_mode': self.fusion_gate_mode,
                 'mask_degree_mode': self.mask_degree_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'n_ui_layers': self.n_ui_layers,

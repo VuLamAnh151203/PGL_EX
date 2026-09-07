@@ -84,6 +84,7 @@ class DualModalityTest(unittest.TestCase):
         cl_weight=0.0,
         mask_graph_mode='hard',
         mask_sharing_mode='separate',
+        fusion_gate_mode='separate',
     ):
         return NullableConfig(
             {
@@ -105,6 +106,7 @@ class DualModalityTest(unittest.TestCase):
                 'n_ui_layers': 2,
                 'mm_image_weight': 0.25,
                 'mask_sharing_mode': mask_sharing_mode,
+                'fusion_gate_mode': fusion_gate_mode,
                 'mask_graph_mode': mask_graph_mode,
                 'mask_degree_mode': 'full',
                 'mask_keep_ratio': 0.3,
@@ -123,6 +125,7 @@ class DualModalityTest(unittest.TestCase):
         cl_weight=0.0,
         mask_graph_mode='hard',
         mask_sharing_mode='separate',
+        fusion_gate_mode='separate',
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -130,6 +133,7 @@ class DualModalityTest(unittest.TestCase):
                 cl_weight,
                 mask_graph_mode,
                 mask_sharing_mode,
+                fusion_gate_mode,
             ),
             FakeTrainData(),
         )
@@ -287,6 +291,98 @@ class DualModalityTest(unittest.TestCase):
                 image_adj.coalesce().values(),
                 text_adj.coalesce().values(),
             )
+
+    def test_shared_fusion_gate_matches_joint_full_masked_formula(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_sharing_mode='separate',
+                fusion_gate_mode='shared',
+            )
+            self.assertIsNone(model.image_fusion_gate)
+            self.assertIsNone(model.text_fusion_gate)
+            self.assertEqual(
+                tuple(model.shared_fusion_gate.weight.shape), (4, 8)
+            )
+            self.assertIsNot(
+                model.image_mask_logits, model.text_mask_logits
+            )
+
+            model.eval()
+            users, _ = model.forward(model.norm_adj)
+            representations = model.latest_representations
+            full_users = torch.cat(
+                (
+                    representations['image_full_users'],
+                    representations['text_full_users'],
+                ),
+                dim=1,
+            )
+            masked_users = torch.cat(
+                (
+                    representations['image_masked_users'],
+                    representations['text_masked_users'],
+                ),
+                dim=1,
+            )
+            expected_user_gate = torch.sigmoid(
+                model.shared_fusion_gate(
+                    torch.cat((full_users, masked_users), dim=1)
+                )
+            )
+            expected_users = (
+                expected_user_gate * full_users
+                + (1.0 - expected_user_gate) * masked_users
+            )
+            torch.testing.assert_close(users, expected_users)
+            torch.testing.assert_close(
+                representations['shared_user_gate'], expected_user_gate
+            )
+
+            full_items = torch.cat(
+                (
+                    representations['image_full_items'],
+                    representations['text_full_items'],
+                ),
+                dim=1,
+            )
+            masked_items = torch.cat(
+                (
+                    representations['image_masked_items'],
+                    representations['text_masked_items'],
+                ),
+                dim=1,
+            )
+            expected_item_gate = torch.sigmoid(
+                model.shared_fusion_gate(
+                    torch.cat((full_items, masked_items), dim=1)
+                )
+            )
+            expected_ui_items = (
+                expected_item_gate * full_items
+                + (1.0 - expected_item_gate) * masked_items
+            )
+            torch.testing.assert_close(
+                representations['ui_items'], expected_ui_items
+            )
+
+            model.train()
+            loss = model.calculate_loss(self.interaction())
+            loss.backward()
+            for parameter in (
+                model.shared_fusion_gate.weight,
+                model.image_mask_logits,
+                model.text_mask_logits,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['fusion_gate_mode'], 'shared'
+            )
+            self.assertEqual(set(artifacts['masks']), {'image', 'text'})
 
     def test_loss_gradients_cl_switch_and_input_immutability(self):
         with tempfile.TemporaryDirectory() as root:

@@ -10,9 +10,12 @@ n_mm_layers: 1
 knn_k: 10
 mm_image_weight: 0.1
 
-# shared: image/text masked branches use one theta_ui and the same edge mask.
-# separate: each modality learns its own mask parameter.
-mask_sharing_mode: shared
+# This experiment keeps independent image/text edge masks.
+mask_sharing_mode: separate
+
+# shared: concatenate modalities first, then use one full-vs-masked gate.
+# separate: fuse full/masked inside each modality using two gates.
+fusion_gate_mode: shared
 
 # Each modality has a full and a masked U-I branch.
 mask_graph_mode: hard
@@ -23,7 +26,7 @@ mask_weight: 0.1
 mask_binary_weight: 0.1
 
 # Original PGL dropout-view CL. Zero disables InfoNCE completely.
-cl_weight: 0.05
+cl_weight: 0.1
 cl_temperature: 0.2
 dropout: 0.2
 
