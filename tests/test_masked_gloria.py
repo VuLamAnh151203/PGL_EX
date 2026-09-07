@@ -87,6 +87,10 @@ class MaskedGloriaTest(unittest.TestCase):
         item_embedding_mode='id',
         mm_propagation_mode='sequential',
         fusion='concat',
+        n_ui_layers=2,
+        mask_graph_mode='soft',
+        mask_degree_mode='full',
+        user_embedding_mode='shared',
     ):
         return NullableConfig(
             {
@@ -105,6 +109,7 @@ class MaskedGloriaTest(unittest.TestCase):
                 'feat_embed_dim': 2,
                 'knn_k': 2,
                 'n_mm_layers': 1,
+                'n_ui_layers': n_ui_layers,
                 'mm_image_weight': image_weight,
                 'aggr_mode': 'add',
                 'fusion': fusion,
@@ -116,6 +121,10 @@ class MaskedGloriaTest(unittest.TestCase):
                 'dropout': dropout,
                 'item_embedding_mode': item_embedding_mode,
                 'mm_propagation_mode': mm_propagation_mode,
+                'mask_graph_mode': mask_graph_mode,
+                'mask_degree_mode': mask_degree_mode,
+                'hard_mask_temperature': 1.0,
+                'user_embedding_mode': user_embedding_mode,
             }
         )
 
@@ -128,6 +137,10 @@ class MaskedGloriaTest(unittest.TestCase):
         item_embedding_mode='id',
         mm_propagation_mode='sequential',
         fusion='concat',
+        n_ui_layers=2,
+        mask_graph_mode='soft',
+        mask_degree_mode='full',
+        user_embedding_mode='shared',
     ):
         return MASKED_GLORIA(
             self.make_config(
@@ -138,6 +151,10 @@ class MaskedGloriaTest(unittest.TestCase):
                 item_embedding_mode,
                 mm_propagation_mode,
                 fusion,
+                n_ui_layers,
+                mask_graph_mode,
+                mask_degree_mode,
+                user_embedding_mode,
             ),
             FakeTrainData(),
         )
@@ -234,7 +251,7 @@ class MaskedGloriaTest(unittest.TestCase):
             actual = model.InfoNCE(first, second, temperature)
             torch.testing.assert_close(actual, expected)
 
-    def test_three_hop_gcn_matches_dense_reference(self):
+    def test_pgl_layer_mean_gcn_matches_dense_reference(self):
         features = torch.tensor([[0.6, 0.8], [0.8, -0.6]])
         model = GCN(
             datasets=None,
@@ -268,7 +285,6 @@ class MaskedGloriaTest(unittest.TestCase):
         )
 
         initial = torch.cat((model.preference, features), dim=0)
-        initial = torch.nn.functional.normalize(initial, dim=-1)
         source, target = edge_index
         adjacency = torch.zeros(4, 4)
         adjacency.index_put_(
@@ -277,7 +293,7 @@ class MaskedGloriaTest(unittest.TestCase):
         first = adjacency @ initial
         second = adjacency @ first
         third = adjacency @ second
-        expected = initial + first + second + third
+        expected = (initial + first + second + third) / 4.0
         torch.testing.assert_close(actual, expected)
 
     def test_edge_propagation_handles_large_sparse_node_space(self):
@@ -530,6 +546,76 @@ class MaskedGloriaTest(unittest.TestCase):
             )
             torch.testing.assert_close(
                 restored_rep['items'], expected_rep['items']
+            )
+
+    def test_pgl_masked_backbone_with_sequential_item_routing(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                item_embedding_mode='multimodal',
+                mm_propagation_mode='sequential',
+                fusion='gated_sum',
+                n_ui_layers=2,
+                mask_graph_mode='hard',
+                mask_degree_mode='full',
+                user_embedding_mode='separate',
+            )
+
+            self.assertIsNotNone(model.second_user_image)
+            self.assertIsNotNone(model.second_user_text)
+            self.assertEqual(model.full_gcn.num_layer, 2)
+            self.assertEqual(model.mask_gcn.num_layer, 2)
+
+            model.eval()
+            probabilities = torch.sigmoid(model.mask_logits)
+            edge_mask, edge_norm = model._masked_edge_parameters(
+                probabilities
+            )
+            self.assertEqual(
+                int(torch.count_nonzero(edge_mask[:model.num_interactions])),
+                model.hard_keep_count,
+            )
+            torch.testing.assert_close(edge_norm, model.full_edge_norm)
+
+            representations = model._encode()
+            self.assertEqual(tuple(representations['users'].shape), (3, 4))
+            self.assertEqual(tuple(representations['items'].shape), (4, 4))
+            expected_full_items = model.item_item(
+                representations['full_items']
+            )
+            expected_masked_items = model.item_item(
+                representations['masked_items']
+            )
+            expected_items, _ = model._fuse_branches(
+                expected_full_items, expected_masked_items
+            )
+            torch.testing.assert_close(
+                representations['items'], expected_items
+            )
+
+            model.train()
+            model.pre_epoch_processing()
+            loss = model.calculate_loss(self.training_interaction())
+            loss.backward()
+            for parameter in (
+                model.second_user_image.weight,
+                model.second_user_text.weight,
+                model.fusion_gate.weight,
+                model.mask_logits,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['mask_graph_mode'], 'hard'
+            )
+            self.assertEqual(
+                artifacts['metadata']['user_embedding_mode'], 'separate'
+            )
+            self.assertIn(
+                'second_user_image.weight', artifacts['embedding_tables']
             )
 
     def test_valid_cache_is_reused_and_stale_cache_is_rebuilt(self):

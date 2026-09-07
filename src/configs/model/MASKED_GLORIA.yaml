@@ -6,6 +6,7 @@ learning_rate: 0.001
 
 # Multimodal item-item graph.
 n_mm_layers: 1
+n_ui_layers: 2
 knn_k: 10
 mm_image_weight: 0.1
 
@@ -22,16 +23,23 @@ mm_propagation_mode: sequential
 # gated_sum: PGL-style gated sum after I-I propagation (final width 2d).
 # Keeping gated_sum fixed lets parallel/sequential be compared at equal width.
 aggr_mode: add
-# fusion: gated_sum
-fusion: concat
-# Soft interaction-mask budget and binarization regularizer.
+fusion: gated_sum
+
+# Match the active PGL_MASKED backbone: a hard top-k second branch with
+# full-graph degree normalization and independent user tables per branch.
+mask_graph_mode: hard
+mask_degree_mode: full
+hard_mask_temperature: 1.0
+user_embedding_mode: separate
+
+# Mask probability budget and binarization regularizer.
 mask_keep_ratio: 0.3
 mask_weight: 0.1
 mask_binary_weight: 0.1
 
 # Original PGL dropout-view contrastive learning. Set cl_weight to 0.0 to
 # disable it completely.
-cl_weight: 0.5
+cl_weight: 0.0
 cl_temperature: 0.2
 dropout: 0.2
 

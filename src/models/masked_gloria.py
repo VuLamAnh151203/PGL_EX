@@ -1,13 +1,11 @@
 """Multimodal, memory-safe MASKED_GLORIA for the PGL pipeline.
 
-This implementation keeps the original GLORIA full and softly masked
-user-item branches and three propagation steps summed with the initial
-embeddings. ``id`` mode retains the original ID-only branch inputs.
-``multimodal`` mode keeps image and text in their concatenated ``2d`` space,
-with one user table per modality as in PGL. I-I propagation can be parallel
-with U-I propagation or sequential after it; the two branches can then be
-concatenated or combined by a PGL-style gated sum. Edge-index propagation
-avoids dense ``(n_users + n_items) ** 2`` mask gradients.
+The public classes and method signatures follow MASKED_GLORIA, while the
+multimodal U-I backbone follows PGL_MASKED: modality-specific user tables,
+layer-mean propagation, a full and a masked branch, and gated fusion. The
+requested sequential route sends each branch's U-I item representation
+through the I-I graph before fusion. Edge-index propagation avoids dense
+``(n_users + n_items) ** 2`` mask gradients.
 """
 
 import math
@@ -39,6 +37,7 @@ class MASKED_GLORIA(GeneralRecommender):
             _config_value(config, 'feat_embed_dim', self.embedding_dim)
         )
         self.n_layers = int(_config_value(config, 'n_mm_layers', 1))
+        self.n_ui_layers = int(_config_value(config, 'n_ui_layers', 2))
         self.knn_k = int(_config_value(config, 'knn_k', 10))
         self.mm_image_weight = float(
             _config_value(config, 'mm_image_weight', 0.1)
@@ -61,6 +60,18 @@ class MASKED_GLORIA(GeneralRecommender):
         self.mm_propagation_mode = str(
             _config_value(config, 'mm_propagation_mode', 'sequential')
         ).lower()
+        self.mask_graph_mode = str(
+            _config_value(config, 'mask_graph_mode', 'soft')
+        ).lower()
+        self.mask_degree_mode = str(
+            _config_value(config, 'mask_degree_mode', 'full')
+        ).lower()
+        self.hard_mask_temperature = float(
+            _config_value(config, 'hard_mask_temperature', 1.0)
+        )
+        self.user_embedding_mode = str(
+            _config_value(config, 'user_embedding_mode', 'shared')
+        ).lower()
         self.aggr_mode = str(_config_value(config, 'aggr_mode', 'add')).lower()
         self.fusion = str(_config_value(config, 'fusion', 'concat')).lower()
 
@@ -72,6 +83,8 @@ class MASKED_GLORIA(GeneralRecommender):
             )
         if self.n_layers < 0:
             raise ValueError('n_mm_layers must be non-negative.')
+        if self.n_ui_layers < 0:
+            raise ValueError('n_ui_layers must be non-negative.')
         if self.knn_k <= 0:
             raise ValueError('knn_k must be positive.')
         if not 0.0 <= self.mm_image_weight <= 1.0:
@@ -101,6 +114,18 @@ class MASKED_GLORIA(GeneralRecommender):
             raise ValueError(
                 "item_embedding_mode='id' only supports "
                 "mm_propagation_mode='sequential'."
+            )
+        if self.mask_graph_mode not in {'soft', 'hard'}:
+            raise ValueError("mask_graph_mode must be 'soft' or 'hard'.")
+        if self.mask_degree_mode not in {'full', 'masked'}:
+            raise ValueError(
+                "mask_degree_mode must be 'full' or 'masked'."
+            )
+        if self.hard_mask_temperature <= 0.0:
+            raise ValueError('hard_mask_temperature must be positive.')
+        if self.user_embedding_mode not in {'shared', 'separate'}:
+            raise ValueError(
+                "user_embedding_mode must be 'shared' or 'separate'."
             )
         if self.aggr_mode != 'add':
             raise ValueError("MASKED_GLORIA only supports aggr_mode='add'.")
@@ -189,6 +214,8 @@ class MASKED_GLORIA(GeneralRecommender):
             self.text_trs = None
             self.user_image = None
             self.user_text = None
+            self.second_user_image = None
+            self.second_user_text = None
             full_gcn_features = self.id_embedding_full.weight
             masked_gcn_features = self.id_embedding_masked.weight
         else:
@@ -217,6 +244,18 @@ class MASKED_GLORIA(GeneralRecommender):
                 nn.init.zeros_(projection.bias)
             nn.init.xavier_uniform_(self.user_image.weight)
             nn.init.xavier_uniform_(self.user_text.weight)
+            if self.user_embedding_mode == 'separate':
+                self.second_user_image = nn.Embedding(
+                    self.n_users, self.feat_embed_dim
+                )
+                self.second_user_text = nn.Embedding(
+                    self.n_users, self.feat_embed_dim
+                )
+                nn.init.xavier_uniform_(self.second_user_image.weight)
+                nn.init.xavier_uniform_(self.second_user_text.weight)
+            else:
+                self.second_user_image = None
+                self.second_user_text = None
             feature_template = self.v_feat.new_empty(
                 (self.n_items, self.branch_embedding_dim)
             )
@@ -230,7 +269,7 @@ class MASKED_GLORIA(GeneralRecommender):
             'num_item': self.n_items,
             'dim_id': self.embedding_dim,
             'aggr_mode': self.aggr_mode,
-            'num_layer': 3,
+            'num_layer': self.n_ui_layers,
             'has_feature': False,
             'dropout': 0.0,
             'dim_latent': self.branch_embedding_dim,
@@ -254,6 +293,17 @@ class MASKED_GLORIA(GeneralRecommender):
         else:
             self.fusion_gate = None
 
+        self.register_buffer(
+            'hard_train_indices',
+            torch.empty(0, dtype=torch.long, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            'hard_eval_indices',
+            torch.empty(0, dtype=torch.long, device=self.device),
+            persistent=False,
+        )
+
         mm_adj = self._build_or_load_mm_graph(config)
         self.register_buffer('mm_adj', mm_adj.coalesce())
         self.cl_dropout_layer = nn.Dropout(self.cl_dropout)
@@ -275,6 +325,91 @@ class MASKED_GLORIA(GeneralRecommender):
             torch.zeros_like(degree_inv_sqrt),
         )
         return degree_inv_sqrt[source] * degree_inv_sqrt[target]
+
+    @property
+    def hard_keep_count(self):
+        return max(
+            1,
+            min(
+                self.num_interactions,
+                int(round(self.num_interactions * self.mask_keep_ratio)),
+            ),
+        )
+
+    @torch.no_grad()
+    def _sample_hard_train_indices(self):
+        uniform_noise = torch.rand_like(self.mask_logits).clamp_(
+            1e-8, 1.0 - 1e-8
+        )
+        gumbel_noise = -torch.log(-torch.log(uniform_noise))
+        selection_scores = (
+            self.mask_logits / self.hard_mask_temperature + gumbel_noise
+        )
+        return torch.topk(
+            selection_scores, self.hard_keep_count, sorted=False
+        ).indices
+
+    @torch.no_grad()
+    def _select_hard_eval_indices(self):
+        return torch.topk(
+            self.mask_logits, self.hard_keep_count, sorted=False
+        ).indices
+
+    def pre_epoch_processing(self):
+        if self.mask_graph_mode == 'hard':
+            self.hard_train_indices = self._sample_hard_train_indices()
+
+    def post_epoch_processing(self):
+        if self.mask_graph_mode == 'hard':
+            self.hard_eval_indices = self._select_hard_eval_indices()
+
+    def _current_hard_indices(self):
+        if self.training:
+            if self.hard_train_indices.numel() == 0:
+                self.hard_train_indices = self._sample_hard_train_indices()
+            return self.hard_train_indices
+
+        if self.hard_eval_indices.numel() == 0:
+            self.hard_eval_indices = self._select_hard_eval_indices()
+        return self.hard_eval_indices
+
+    def _normalization_for_edge_weights(self, edge_weights):
+        source, target = self.edge_index
+        degree = torch.zeros(
+            self.n_users + self.n_items,
+            dtype=edge_weights.dtype,
+            device=edge_weights.device,
+        )
+        degree.index_add_(0, source, edge_weights)
+        degree_inv_sqrt = degree.clamp_min(1e-12).pow(-0.5)
+        degree_inv_sqrt = torch.where(
+            degree > 0,
+            degree_inv_sqrt,
+            torch.zeros_like(degree_inv_sqrt),
+        )
+        return degree_inv_sqrt[source] * degree_inv_sqrt[target]
+
+    def _masked_edge_parameters(self, interaction_mask):
+        if self.mask_graph_mode == 'hard':
+            kept = self._current_hard_indices()
+            selected_soft = interaction_mask.index_select(0, kept)
+            selected_straight_through = (
+                torch.ones_like(selected_soft)
+                + selected_soft
+                - selected_soft.detach()
+            )
+            one_direction_mask = interaction_mask.new_zeros(
+                self.num_interactions
+            ).scatter(0, kept, selected_straight_through)
+        else:
+            one_direction_mask = interaction_mask
+
+        edge_mask = torch.cat(
+            (one_direction_mask, one_direction_mask), dim=0
+        )
+        if self.mask_degree_mode == 'full':
+            return edge_mask, self.full_edge_norm
+        return edge_mask, self._normalization_for_edge_weights(edge_mask)
 
     def _mm_cache_metadata(self, config):
         return {
@@ -435,11 +570,22 @@ class MASKED_GLORIA(GeneralRecommender):
             user_features = torch.cat(
                 (self.user_image.weight, self.user_text.weight), dim=1
             )
+            if self.second_user_image is not None:
+                masked_user_features = torch.cat(
+                    (
+                        self.second_user_image.weight,
+                        self.second_user_text.weight,
+                    ),
+                    dim=1,
+                )
+            else:
+                masked_user_features = user_features
             full_initial_items = multimodal_items
             masked_initial_items = multimodal_items
         else:
             multimodal_items = None
             user_features = None
+            masked_user_features = None
             full_initial_items = self.id_embedding_full.weight
             masked_initial_items = self.id_embedding_masked.weight
 
@@ -451,13 +597,15 @@ class MASKED_GLORIA(GeneralRecommender):
         )
 
         interaction_mask = torch.sigmoid(self.mask_logits)
-        edge_mask = torch.cat((interaction_mask, interaction_mask), dim=0)
+        edge_mask, masked_edge_norm = self._masked_edge_parameters(
+            interaction_mask
+        )
         masked_rep, masked_preference = self.mask_gcn(
             self.edge_index,
             masked_initial_items,
             edge_mask=edge_mask,
-            edge_norm=self.full_edge_norm,
-            user_features=user_features,
+            edge_norm=masked_edge_norm,
+            user_features=masked_user_features,
         )
 
         full_users, full_items = torch.split(
@@ -642,15 +790,24 @@ class MASKED_GLORIA(GeneralRecommender):
                 'user_image.weight': self.user_image.weight.detach().cpu(),
                 'user_text.weight': self.user_text.weight.detach().cpu(),
             })
+            if self.second_user_image is not None:
+                embedding_tables.update({
+                    'second_user_image.weight': (
+                        self.second_user_image.weight.detach().cpu()
+                    ),
+                    'second_user_text.weight': (
+                        self.second_user_text.weight.detach().cpu()
+                    ),
+                })
 
         artifacts = {
             'metadata': {
                 'model': self.__class__.__name__,
-                'mask_graph_mode': 'soft',
-                'mask_degree_mode': 'full',
+                'mask_graph_mode': self.mask_graph_mode,
+                'mask_degree_mode': self.mask_degree_mode,
                 'ui_branch_mode': 'dual',
                 'ui_fusion_mode': self.fusion,
-                'user_embedding_mode': 'separate',
+                'user_embedding_mode': self.user_embedding_mode,
                 'item_embedding_mode': self.item_embedding_mode,
                 'mm_propagation_mode': self.mm_propagation_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
@@ -659,6 +816,7 @@ class MASKED_GLORIA(GeneralRecommender):
                 'mm_image_weight': self.mm_image_weight,
                 'knn_k': self.knn_k,
                 'n_mm_layers': self.n_layers,
+                'n_ui_layers': self.n_ui_layers,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,
@@ -690,7 +848,7 @@ class MASKED_GLORIA(GeneralRecommender):
 
 
 class GCN(nn.Module):
-    """Three-hop parameter-free graph convolution used by GLORIA."""
+    """PGL layer-mean U-I propagation behind the GLORIA-compatible API."""
 
     def __init__(
         self,
@@ -773,18 +931,18 @@ class GCN(nn.Module):
                 )
             )
 
-        x = torch.cat((preference, features), dim=0)
-        x = F.normalize(x, p=2, dim=-1, eps=1e-12)
-        h = self.conv_embed_1(
-            x, edge_index, edge_mask=edge_mask, edge_norm=edge_norm
-        )
-        h_1 = self.conv_embed_1(
-            h, edge_index, edge_mask=edge_mask, edge_norm=edge_norm
-        )
-        h_2 = self.conv_embed_1(
-            h_1, edge_index, edge_mask=edge_mask, edge_norm=edge_norm
-        )
-        return x + h + h_1 + h_2, preference
+        current = torch.cat((preference, features), dim=0)
+        all_embeddings = [current]
+        for _ in range(self.num_layer):
+            current = self.conv_embed_1(
+                current,
+                edge_index,
+                edge_mask=edge_mask,
+                edge_norm=edge_norm,
+            )
+            all_embeddings.append(current)
+        propagated = torch.stack(all_embeddings, dim=1).mean(dim=1)
+        return propagated, preference
 
 
 class Base_gcn(nn.Module):
