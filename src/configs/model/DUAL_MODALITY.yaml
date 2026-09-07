@@ -19,7 +19,7 @@ mask_weight: 0.1
 mask_binary_weight: 0.1
 
 # Original PGL dropout-view CL. Zero disables InfoNCE completely.
-cl_weight: 0.0
+cl_weight: 0.05
 cl_temperature: 0.2
 dropout: 0.2
 
