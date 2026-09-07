@@ -33,6 +33,11 @@ cl_weight: 0.1
 cl_temperature: 0.2
 dropout: 0.2
 
+# modality: joint BPR + weighted mean of image/text BPR losses.
+# none: use joint BPR only. A zero weight also disables auxiliary BPR.
+aux_bpr_mode: modality
+aux_bpr_weight: 0.1
+
 save_analysis_artifacts: True
 restore_best_model: True
 

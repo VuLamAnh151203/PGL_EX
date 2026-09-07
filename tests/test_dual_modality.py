@@ -15,6 +15,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from models.dual_modality import DUAL_MODALITY  # noqa: E402
+from mask_analysis.dual_modality_diagnostics import (  # noqa: E402
+    summarize_rankings,
+)
 
 
 class NullableConfig(dict):
@@ -86,6 +89,8 @@ class DualModalityTest(unittest.TestCase):
         mask_sharing_mode='separate',
         fusion_gate_mode='separate',
         cl_mode='pgl_dropout',
+        aux_bpr_mode='none',
+        aux_bpr_weight=0.0,
     ):
         return NullableConfig(
             {
@@ -116,6 +121,8 @@ class DualModalityTest(unittest.TestCase):
                 'mask_binary_weight': 0.1,
                 'cl_weight': cl_weight,
                 'cl_mode': cl_mode,
+                'aux_bpr_mode': aux_bpr_mode,
+                'aux_bpr_weight': aux_bpr_weight,
                 'cl_temperature': 0.2,
                 'dropout': 0.2,
             }
@@ -129,6 +136,8 @@ class DualModalityTest(unittest.TestCase):
         mask_sharing_mode='separate',
         fusion_gate_mode='separate',
         cl_mode='pgl_dropout',
+        aux_bpr_mode='none',
+        aux_bpr_weight=0.0,
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -138,6 +147,8 @@ class DualModalityTest(unittest.TestCase):
                 mask_sharing_mode,
                 fusion_gate_mode,
                 cl_mode,
+                aux_bpr_mode,
+                aux_bpr_weight,
             ),
             FakeTrainData(),
         )
@@ -481,6 +492,101 @@ class DualModalityTest(unittest.TestCase):
             self.assertEqual(
                 artifacts['metadata']['cl_mode'], 'full_masked_concat'
             )
+
+    def test_modality_aux_bpr_and_score_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                cl_weight=0.0,
+                mask_sharing_mode='separate',
+                fusion_gate_mode='shared',
+                aux_bpr_mode='modality',
+                aux_bpr_weight=0.4,
+            )
+            interaction = self.interaction()
+            loss = model.calculate_loss(interaction)
+            representations = model.latest_representations
+
+            image_loss = model.bpr_loss(
+                representations['image_users'][interaction[0]],
+                representations['image_items'][interaction[1]],
+                representations['image_items'][interaction[2]],
+            )
+            text_loss = model.bpr_loss(
+                representations['text_users'][interaction[0]],
+                representations['text_items'][interaction[1]],
+                representations['text_items'][interaction[2]],
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['image_bpr'],
+                image_loss.detach(),
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['text_bpr'],
+                text_loss.detach(),
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['aux_bpr'],
+                (0.5 * (image_loss + text_loss)).detach(),
+            )
+            expected_total = (
+                model.latest_loss_components['bpr']
+                + 0.4 * model.latest_loss_components['aux_bpr']
+                + model.mask_weight
+                * model.latest_loss_components['mask']
+            )
+            torch.testing.assert_close(loss.detach(), expected_total)
+
+            scores = model.full_sort_predict_modalities(
+                (interaction[0],)
+            )
+            torch.testing.assert_close(
+                scores['joint'], scores['image'] + scores['text']
+            )
+            torch.testing.assert_close(
+                scores['joint'],
+                model.full_sort_predict((interaction[0],)),
+            )
+
+            margins = model.modality_triplet_margins(interaction)
+            batch_rows = torch.arange(interaction.shape[1])
+            for modality in ('image', 'text', 'joint'):
+                expected_margin = (
+                    scores[modality][batch_rows, interaction[1]]
+                    - scores[modality][batch_rows, interaction[2]]
+                )
+                torch.testing.assert_close(
+                    margins[modality], expected_margin
+                )
+
+            loss.backward()
+            self.assertTrue(torch.isfinite(model.image_trs.weight.grad).all())
+            self.assertTrue(torch.isfinite(model.text_trs.weight.grad).all())
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['aux_bpr_mode'], 'modality'
+            )
+            self.assertEqual(
+                artifacts['metadata']['aux_bpr_weight'], 0.4
+            )
+
+    def test_post_training_ranking_summary_reports_rescue_and_harm(self):
+        positive_items = [np.array([1]), np.array([2])]
+        rankings = {
+            'image': np.array([[1, 0], [0, 2]]),
+            'text': np.array([[0, 1], [2, 0]]),
+            'joint': np.array([[1, 0], [0, 2]]),
+        }
+        result = summarize_rankings(rankings, positive_items, [1, 2])
+        self.assertEqual(result['ranking_metrics']['joint']['Recall@1'], 0.5)
+        top1 = result['complementarity']['Top1']
+        self.assertEqual(top1['image_rescue_count'], 1)
+        self.assertEqual(top1['text_miss_count'], 1)
+        self.assertEqual(top1['image_rescue_rate_among_text_misses'], 1.0)
+        self.assertEqual(top1['image_harm_count'], 1)
+        self.assertEqual(top1['text_hit_count'], 1)
+        self.assertEqual(top1['image_harm_rate_among_text_hits'], 1.0)
 
     def test_graph_mix_full_sort_artifacts_and_checkpoint(self):
         with tempfile.TemporaryDirectory() as root:

@@ -60,6 +60,12 @@ class DUAL_MODALITY(GeneralRecommender):
         self.cl_mode = str(
             _config_value(config, 'cl_mode', 'pgl_dropout')
         ).lower()
+        self.aux_bpr_mode = str(
+            _config_value(config, 'aux_bpr_mode', 'none')
+        ).lower()
+        self.aux_bpr_weight = float(
+            _config_value(config, 'aux_bpr_weight', 0.0)
+        )
         self.mask_keep_ratio = float(
             _config_value(config, 'mask_keep_ratio', 0.3)
         )
@@ -108,6 +114,12 @@ class DUAL_MODALITY(GeneralRecommender):
                 "cl_mode must be 'pgl_dropout' or "
                 "'full_masked_concat'."
             )
+        if self.aux_bpr_mode not in {'none', 'modality'}:
+            raise ValueError(
+                "aux_bpr_mode must be 'none' or 'modality'."
+            )
+        if self.aux_bpr_weight < 0.0:
+            raise ValueError('aux_bpr_weight must be non-negative.')
         if not 0.0 <= self.cl_dropout < 1.0:
             raise ValueError('dropout must be in [0, 1).')
         if self.mask_graph_mode not in {'soft', 'hard'}:
@@ -737,6 +749,23 @@ class DUAL_MODALITY(GeneralRecommender):
             )
         )
 
+        image_user_embeddings = (
+            image_user_gate * image_full_users
+            + (1.0 - image_user_gate) * image_masked_users
+        )
+        text_user_embeddings = (
+            text_user_gate * text_full_users
+            + (1.0 - text_user_gate) * text_masked_users
+        )
+        image_ui_item_embeddings = (
+            image_item_gate * image_full_items
+            + (1.0 - image_item_gate) * image_masked_items
+        )
+        text_ui_item_embeddings = (
+            text_item_gate * text_full_items
+            + (1.0 - text_item_gate) * text_masked_items
+        )
+
         full_user_embeddings = torch.cat(
             (image_full_users, text_full_users), dim=1
         )
@@ -756,13 +785,34 @@ class DUAL_MODALITY(GeneralRecommender):
             mm_item_embeddings = torch.sparse.mm(
                 self.mm_adj, mm_item_embeddings
             )
-        final_item_embeddings = ui_item_embeddings + mm_item_embeddings
+        image_mm_item_embeddings, text_mm_item_embeddings = torch.split(
+            mm_item_embeddings,
+            [self.embedding_dim, self.embedding_dim],
+            dim=1,
+        )
+        image_item_embeddings = (
+            image_ui_item_embeddings + image_mm_item_embeddings
+        )
+        text_item_embeddings = (
+            text_ui_item_embeddings + text_mm_item_embeddings
+        )
+        final_item_embeddings = torch.cat(
+            (image_item_embeddings, text_item_embeddings), dim=1
+        )
 
         self.latest_representations = {
             'users': user_embeddings,
             'items': final_item_embeddings,
             'ui_items': ui_item_embeddings,
             'mm_items': mm_item_embeddings,
+            'image_users': image_user_embeddings,
+            'text_users': text_user_embeddings,
+            'image_items': image_item_embeddings,
+            'text_items': text_item_embeddings,
+            'image_ui_items': image_ui_item_embeddings,
+            'text_ui_items': text_ui_item_embeddings,
+            'image_mm_items': image_mm_item_embeddings,
+            'text_mm_items': text_mm_item_embeddings,
             'full_users': full_user_embeddings,
             'masked_users': masked_user_embeddings,
             'full_items': full_item_embeddings,
@@ -811,18 +861,55 @@ class DUAL_MODALITY(GeneralRecommender):
             user_embeddings, positive_embeddings, negative_embeddings
         )
 
+        if (
+            self.aux_bpr_mode == 'modality'
+            and self.aux_bpr_weight > 0.0
+        ):
+            representations = self.latest_representations
+            image_ranking_loss = self.bpr_loss(
+                representations['image_users'][users],
+                representations['image_items'][pos_items],
+                representations['image_items'][neg_items],
+            )
+            text_ranking_loss = self.bpr_loss(
+                representations['text_users'][users],
+                representations['text_items'][pos_items],
+                representations['text_items'][neg_items],
+            )
+            auxiliary_ranking_loss = 0.5 * (
+                image_ranking_loss + text_ranking_loss
+            )
+        else:
+            image_ranking_loss = ranking_loss.new_zeros(())
+            text_ranking_loss = ranking_loss.new_zeros(())
+            auxiliary_ranking_loss = ranking_loss.new_zeros(())
+
         if self.cl_weight > 0.0:
+            # if self.cl_mode == 'full_masked_concat':
+            #     representations = self.latest_representations
+            #     user_cl_loss = self.InfoNCE(
+            #         representations['full_users'][users],
+            #         representations['masked_users'][users],
+            #         self.cl_temperature,
+            #     )
+            #     item_cl_loss = self.InfoNCE(
+            #         representations['full_items'][pos_items],
+            #         representations['masked_items'][pos_items],
+            #         self.cl_temperature,
+            #     )
+
             if self.cl_mode == 'full_masked_concat':
                 representations = self.latest_representations
-                user_cl_loss = self.InfoNCE(
-                    representations['full_users'][users],
-                    representations['masked_users'][users],
-                    self.cl_temperature,
+                unique_users = torch.unique(users)
+                unique_items = torch.unique(pos_items)
+
+                user_cl_loss = self.symmetric_info_nce(
+                    representations['full_users'][unique_users],
+                    representations['masked_users'][unique_users],
                 )
-                item_cl_loss = self.InfoNCE(
-                    representations['full_items'][pos_items],
-                    representations['masked_items'][pos_items],
-                    self.cl_temperature,
+                item_cl_loss = self.symmetric_info_nce(
+                    representations['full_items'][unique_items],
+                    representations['masked_items'][unique_items],
                 )
             else:
                 user_cl_loss = self.InfoNCE(
@@ -855,11 +942,15 @@ class DUAL_MODALITY(GeneralRecommender):
 
         total_loss = (
             ranking_loss
+            + self.aux_bpr_weight * auxiliary_ranking_loss
             + self.cl_weight * contrastive_loss
             + self.mask_weight * mask_loss
         )
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
+            'aux_bpr': auxiliary_ranking_loss.detach(),
+            'image_bpr': image_ranking_loss.detach(),
+            'text_bpr': text_ranking_loss.detach(),
             'contrastive': contrastive_loss.detach(),
             'mask': mask_loss.detach(),
             'mask_mean': mean_mask_probability.detach(),
@@ -872,6 +963,70 @@ class DUAL_MODALITY(GeneralRecommender):
         user_embeddings = all_user_embeddings[users]
         return torch.matmul(
             user_embeddings, all_item_embeddings.transpose(0, 1)
+        )
+
+    @torch.no_grad()
+    def full_sort_predict_modalities(self, interaction):
+        users = interaction[0]
+        self.forward(self.norm_adj)
+        representations = self.latest_representations
+        image_scores = torch.matmul(
+            representations['image_users'][users],
+            representations['image_items'].transpose(0, 1),
+        )
+        text_scores = torch.matmul(
+            representations['text_users'][users],
+            representations['text_items'].transpose(0, 1),
+        )
+        return {
+            'image': image_scores,
+            'text': text_scores,
+            'joint': image_scores + text_scores,
+        }
+
+    @torch.no_grad()
+    def modality_triplet_margins(self, interaction):
+        users, positive_items, negative_items = interaction[:3]
+        self.forward(self.norm_adj)
+        representations = self.latest_representations
+
+        def margin(user_table, item_table):
+            user_embeddings = user_table[users]
+            positive_embeddings = item_table[positive_items]
+            negative_embeddings = item_table[negative_items]
+            positive_scores = torch.sum(
+                user_embeddings * positive_embeddings, dim=1
+            )
+            negative_scores = torch.sum(
+                user_embeddings * negative_embeddings, dim=1
+            )
+            return positive_scores - negative_scores
+
+        image_margin = margin(
+            representations['image_users'],
+            representations['image_items'],
+        )
+        text_margin = margin(
+            representations['text_users'],
+            representations['text_items'],
+        )
+        return {
+            'image': image_margin,
+            'text': text_margin,
+            'joint': image_margin + text_margin,
+        }
+
+    def symmetric_info_nce(self, first_view, second_view):
+        first_view = F.normalize(first_view, dim=1)
+        second_view = F.normalize(second_view, dim=1)
+
+        logits = first_view @ second_view.T
+        logits = logits / self.cl_temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+
+        return 0.5 * (
+            F.cross_entropy(logits, labels)
+            + F.cross_entropy(logits.T, labels)
         )
 
     @torch.no_grad()
@@ -906,6 +1061,8 @@ class DUAL_MODALITY(GeneralRecommender):
                 'mm_image_weight': self.mm_image_weight,
                 'cl_weight': self.cl_weight,
                 'cl_mode': self.cl_mode,
+                'aux_bpr_mode': self.aux_bpr_mode,
+                'aux_bpr_weight': self.aux_bpr_weight,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,
