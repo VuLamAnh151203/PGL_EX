@@ -85,6 +85,7 @@ class DualModalityTest(unittest.TestCase):
         mask_graph_mode='hard',
         mask_sharing_mode='separate',
         fusion_gate_mode='separate',
+        cl_mode='pgl_dropout',
     ):
         return NullableConfig(
             {
@@ -114,6 +115,7 @@ class DualModalityTest(unittest.TestCase):
                 'mask_weight': 0.1,
                 'mask_binary_weight': 0.1,
                 'cl_weight': cl_weight,
+                'cl_mode': cl_mode,
                 'cl_temperature': 0.2,
                 'dropout': 0.2,
             }
@@ -126,6 +128,7 @@ class DualModalityTest(unittest.TestCase):
         mask_graph_mode='hard',
         mask_sharing_mode='separate',
         fusion_gate_mode='separate',
+        cl_mode='pgl_dropout',
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -134,6 +137,7 @@ class DualModalityTest(unittest.TestCase):
                 mask_graph_mode,
                 mask_sharing_mode,
                 fusion_gate_mode,
+                cl_mode,
             ),
             FakeTrainData(),
         )
@@ -417,6 +421,65 @@ class DualModalityTest(unittest.TestCase):
             torch.testing.assert_close(interaction, original)
             self.assertEqual(
                 model.latest_loss_components['contrastive'].item(), 0.0
+            )
+
+    def test_full_masked_concat_cl_uses_concatenated_branch_views(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                cl_weight=0.1,
+                mask_sharing_mode='separate',
+                fusion_gate_mode='shared',
+                cl_mode='full_masked_concat',
+            )
+            interaction = self.interaction()
+            original_info_nce = model.InfoNCE
+            with mock.patch.object(
+                model.dropoutf,
+                'forward',
+                side_effect=AssertionError(
+                    'Branch-view CL must not create dropout views.'
+                ),
+            ), mock.patch.object(
+                model, 'InfoNCE', wraps=original_info_nce
+            ) as info_nce:
+                loss = model.calculate_loss(interaction)
+
+            self.assertTrue(torch.isfinite(loss))
+            self.assertEqual(info_nce.call_count, 2)
+            representations = model.latest_representations
+            user_call = info_nce.call_args_list[0].args
+            item_call = info_nce.call_args_list[1].args
+            torch.testing.assert_close(
+                user_call[0],
+                representations['full_users'][interaction[0]],
+            )
+            torch.testing.assert_close(
+                user_call[1],
+                representations['masked_users'][interaction[0]],
+            )
+            torch.testing.assert_close(
+                item_call[0],
+                representations['full_items'][interaction[1]],
+            )
+            torch.testing.assert_close(
+                item_call[1],
+                representations['masked_items'][interaction[1]],
+            )
+            self.assertEqual(user_call[0].shape[1], 4)
+            self.assertEqual(item_call[0].shape[1], 4)
+
+            loss.backward()
+            self.assertTrue(
+                torch.isfinite(model.image_mask_logits.grad).all()
+            )
+            self.assertTrue(
+                torch.isfinite(model.text_mask_logits.grad).all()
+            )
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['cl_mode'], 'full_masked_concat'
             )
 
     def test_graph_mix_full_sort_artifacts_and_checkpoint(self):

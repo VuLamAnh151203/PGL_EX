@@ -57,6 +57,9 @@ class DUAL_MODALITY(GeneralRecommender):
         self.cl_temperature = float(
             _config_value(config, 'cl_temperature', 0.2)
         )
+        self.cl_mode = str(
+            _config_value(config, 'cl_mode', 'pgl_dropout')
+        ).lower()
         self.mask_keep_ratio = float(
             _config_value(config, 'mask_keep_ratio', 0.3)
         )
@@ -100,6 +103,11 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('Mask loss weights must be non-negative.')
         if self.cl_weight < 0.0 or self.cl_temperature <= 0.0:
             raise ValueError('Invalid contrastive-learning configuration.')
+        if self.cl_mode not in {'pgl_dropout', 'full_masked_concat'}:
+            raise ValueError(
+                "cl_mode must be 'pgl_dropout' or "
+                "'full_masked_concat'."
+            )
         if not 0.0 <= self.cl_dropout < 1.0:
             raise ValueError('dropout must be in [0, 1).')
         if self.mask_graph_mode not in {'soft', 'hard'}:
@@ -804,16 +812,29 @@ class DUAL_MODALITY(GeneralRecommender):
         )
 
         if self.cl_weight > 0.0:
-            user_cl_loss = self.InfoNCE(
-                self.dropoutf(user_embeddings),
-                self.dropoutf(user_embeddings),
-                self.cl_temperature,
-            )
-            item_cl_loss = self.InfoNCE(
-                self.dropoutf(positive_embeddings),
-                self.dropoutf(positive_embeddings),
-                self.cl_temperature,
-            )
+            if self.cl_mode == 'full_masked_concat':
+                representations = self.latest_representations
+                user_cl_loss = self.InfoNCE(
+                    representations['full_users'][users],
+                    representations['masked_users'][users],
+                    self.cl_temperature,
+                )
+                item_cl_loss = self.InfoNCE(
+                    representations['full_items'][pos_items],
+                    representations['masked_items'][pos_items],
+                    self.cl_temperature,
+                )
+            else:
+                user_cl_loss = self.InfoNCE(
+                    self.dropoutf(user_embeddings),
+                    self.dropoutf(user_embeddings),
+                    self.cl_temperature,
+                )
+                item_cl_loss = self.InfoNCE(
+                    self.dropoutf(positive_embeddings),
+                    self.dropoutf(positive_embeddings),
+                    self.cl_temperature,
+                )
             contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
         else:
             contrastive_loss = ranking_loss.new_zeros(())
@@ -884,6 +905,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'n_mm_layers': self.n_layers,
                 'mm_image_weight': self.mm_image_weight,
                 'cl_weight': self.cl_weight,
+                'cl_mode': self.cl_mode,
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,

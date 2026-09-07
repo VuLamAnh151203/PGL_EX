@@ -25,7 +25,10 @@ hard_mask_temperature: 1.0
 mask_weight: 0.1
 mask_binary_weight: 0.1
 
-# Original PGL dropout-view CL. Zero disables InfoNCE completely.
+# full_masked_concat: CL between concat(image, text) full/masked views.
+# pgl_dropout: original PGL dropout-view CL on the final embeddings.
+# cl_weight: 0 disables InfoNCE completely in either mode.
+cl_mode: full_masked_concat
 cl_weight: 0.1
 cl_temperature: 0.2
 dropout: 0.2
