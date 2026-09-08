@@ -738,14 +738,19 @@ class DUAL_MODALITY(GeneralRecommender):
         text_masked_adj, text_mask = self._masked_ui_adjacency(
             'text', self._get_mask_logits('text')
         )
-        image_full = self._propagate_ui_graph(
-            adj, image_full_initial, self.n_ui_layers
+        full_initial = torch.cat(
+            (image_full_initial, text_full_initial), dim=1
+        )
+        full = self._propagate_ui_graph(
+            adj, full_initial, self.n_ui_layers
+        )
+        image_full, text_full = torch.split(
+            full,
+            [self.embedding_dim, self.embedding_dim],
+            dim=1,
         )
         image_masked = self._propagate_ui_graph(
             image_masked_adj, image_masked_initial, self.n_ui_layers
-        )
-        text_full = self._propagate_ui_graph(
-            adj, text_full_initial, self.n_ui_layers
         )
         text_masked = self._propagate_ui_graph(
             text_masked_adj, text_masked_initial, self.n_ui_layers

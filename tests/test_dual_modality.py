@@ -166,8 +166,20 @@ class DualModalityTest(unittest.TestCase):
             self.write_features(root)
             model = self.make_model(root)
             model.eval()
-            users, items = model.forward(model.norm_adj)
+            with mock.patch.object(
+                model,
+                '_propagate_ui_graph',
+                wraps=model._propagate_ui_graph,
+            ) as propagate:
+                users, items = model.forward(model.norm_adj)
             representations = model.latest_representations
+
+            self.assertEqual(propagate.call_count, 3)
+            full_initial = propagate.call_args_list[0].args[1]
+            self.assertEqual(
+                tuple(full_initial.shape),
+                (model.n_nodes, 2 * model.embedding_dim),
+            )
 
             self.assertEqual(tuple(users.shape), (3, 4))
             self.assertEqual(tuple(items.shape), (4, 4))
@@ -197,6 +209,26 @@ class DualModalityTest(unittest.TestCase):
                 dim=0,
             )
             torch.testing.assert_close(actual, expected)
+
+            text_features = torch.nn.functional.normalize(
+                model.text_trs(model.text_embedding.weight), dim=-1
+            )
+            text_initial = torch.cat(
+                (model.user_text.weight, text_features), dim=0
+            )
+            text_first = torch.sparse.mm(model.norm_adj, text_initial)
+            text_second = torch.sparse.mm(model.norm_adj, text_first)
+            expected_text = (
+                text_initial + text_first + text_second
+            ) / 3.0
+            actual_text = torch.cat(
+                (
+                    representations['text_full_users'],
+                    representations['text_full_items'],
+                ),
+                dim=0,
+            )
+            torch.testing.assert_close(actual_text, expected_text)
             torch.testing.assert_close(
                 items,
                 representations['ui_items'] + representations['mm_items'],
