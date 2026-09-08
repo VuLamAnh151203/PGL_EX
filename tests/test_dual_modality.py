@@ -844,6 +844,67 @@ class DualModalityTest(unittest.TestCase):
                 artifacts['metadata']['aux_bpr_weight'], 0.4
             )
 
+    def test_masked_branch_aux_bpr_uses_pre_fusion_ui_outputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                cl_weight=0.0,
+                mask_sharing_mode='separate',
+                fusion_gate_mode='shared',
+                aux_bpr_mode='masked_branch',
+                aux_bpr_weight=0.4,
+            )
+            interaction = self.interaction()
+            loss = model.calculate_loss(interaction)
+            representations = model.latest_representations
+
+            image_loss = model.bpr_loss(
+                representations['image_masked_users'][interaction[0]],
+                representations['image_masked_items'][interaction[1]],
+                representations['image_masked_items'][interaction[2]],
+            )
+            text_loss = model.bpr_loss(
+                representations['text_masked_users'][interaction[0]],
+                representations['text_masked_items'][interaction[1]],
+                representations['text_masked_items'][interaction[2]],
+            )
+            expected_auxiliary_loss = 0.5 * (
+                image_loss + text_loss
+            )
+
+            torch.testing.assert_close(
+                model.latest_loss_components['image_bpr'],
+                image_loss.detach(),
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['text_bpr'],
+                text_loss.detach(),
+            )
+            torch.testing.assert_close(
+                model.latest_loss_components['aux_bpr'],
+                expected_auxiliary_loss.detach(),
+            )
+            expected_total = (
+                model.latest_loss_components['bpr']
+                + 0.4 * model.latest_loss_components['aux_bpr']
+                + model.mask_weight
+                * model.latest_loss_components['mask']
+            )
+            torch.testing.assert_close(loss.detach(), expected_total)
+
+            loss.backward()
+            self.assertTrue(
+                torch.isfinite(model.masked_user_image.weight.grad).all()
+            )
+            self.assertTrue(
+                torch.isfinite(model.masked_user_text.weight.grad).all()
+            )
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['aux_bpr_mode'], 'masked_branch'
+            )
+
     def test_post_training_ranking_summary_reports_rescue_and_harm(self):
         positive_items = [np.array([1]), np.array([2])]
         rankings = {

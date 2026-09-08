@@ -175,9 +175,12 @@ class DUAL_MODALITY(GeneralRecommender):
                 "cl_mode must be 'pgl_dropout' or "
                 "'full_masked_concat'."
             )
-        if self.aux_bpr_mode not in {'none', 'modality'}:
+        if self.aux_bpr_mode not in {
+            'none', 'modality', 'masked_branch'
+        }:
             raise ValueError(
-                "aux_bpr_mode must be 'none' or 'modality'."
+                "aux_bpr_mode must be 'none', 'modality', or "
+                "'masked_branch'."
             )
         if self.aux_bpr_weight < 0.0:
             raise ValueError('aux_bpr_weight must be non-negative.')
@@ -1114,19 +1117,30 @@ class DUAL_MODALITY(GeneralRecommender):
         )
 
         if (
-            self.aux_bpr_mode == 'modality'
+            self.aux_bpr_mode != 'none'
             and self.aux_bpr_weight > 0.0
         ):
             representations = self.latest_representations
+            if self.aux_bpr_mode == 'masked_branch':
+                image_users = representations['image_masked_users']
+                image_items = representations['image_masked_items']
+                text_users = representations['text_masked_users']
+                text_items = representations['text_masked_items']
+            else:
+                image_users = representations['image_users']
+                image_items = representations['image_items']
+                text_users = representations['text_users']
+                text_items = representations['text_items']
+
             image_ranking_loss = self.bpr_loss(
-                representations['image_users'][users],
-                representations['image_items'][pos_items],
-                representations['image_items'][neg_items],
+                image_users[users],
+                image_items[pos_items],
+                image_items[neg_items],
             )
             text_ranking_loss = self.bpr_loss(
-                representations['text_users'][users],
-                representations['text_items'][pos_items],
-                representations['text_items'][neg_items],
+                text_users[users],
+                text_items[pos_items],
+                text_items[neg_items],
             )
             auxiliary_ranking_loss = 0.5 * (
                 image_ranking_loss + text_ranking_loss

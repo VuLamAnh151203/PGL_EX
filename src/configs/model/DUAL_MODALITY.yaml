@@ -42,9 +42,10 @@ cl_weight: 0.1
 cl_temperature: 0.2
 dropout: 0.2
 
-# modality: joint BPR + weighted mean of image/text BPR losses.
+# masked_branch: BPR directly on each masked U-I branch before fusion/I-I.
+# modality: BPR on each modality after full-mask fusion and item I-I addition.
 # none: use joint BPR only. A zero weight also disables auxiliary BPR.
-aux_bpr_mode: modality
+aux_bpr_mode: masked_branch
 aux_bpr_weight: 0.1
 
 save_analysis_artifacts: True
