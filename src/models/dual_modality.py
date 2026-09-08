@@ -124,6 +124,15 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mask_binary_weight = float(
             _config_value(config, 'mask_binary_weight', 0.1)
         )
+        self.mask_weight_mode = str(
+            _config_value(config, 'mask_weight_mode', 'sigmoid')
+        ).lower()
+        self.mask_gamma_init = float(
+            _config_value(config, 'mask_gamma_init', 0.5)
+        )
+        self.mask_weight_eps = float(
+            _config_value(config, 'mask_weight_eps', 1e-7)
+        )
         self.mask_specialization_mode = str(
             _config_value(config, 'mask_specialization_mode', 'none')
         ).lower()
@@ -183,6 +192,17 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
         if self.mask_weight < 0.0 or self.mask_binary_weight < 0.0:
             raise ValueError('Mask loss weights must be non-negative.')
+        if self.mask_weight_mode not in {
+            'sigmoid', 'uniform', 'shared', 'separate'
+        }:
+            raise ValueError(
+                "mask_weight_mode must be 'sigmoid', 'uniform', "
+                "'shared', or 'separate'."
+            )
+        if not 0.0 < self.mask_gamma_init < 1.0:
+            raise ValueError('mask_gamma_init must be between 0 and 1.')
+        if self.mask_weight_eps <= 0.0:
+            raise ValueError('mask_weight_eps must be positive.')
         if self.mask_specialization_mode not in {'none', 'user_js'}:
             raise ValueError(
                 "mask_specialization_mode must be 'none' or 'user_js'."
@@ -240,11 +260,14 @@ class DUAL_MODALITY(GeneralRecommender):
             )
         if (
             self.mask_assignment_mode == 'swapped'
-            and self.mask_sharing_mode != 'separate'
+            and (
+                self.mask_sharing_mode != 'separate'
+                or self.mask_weight_mode in {'uniform', 'shared'}
+            )
         ):
             raise ValueError(
                 "mask_assignment_mode='swapped' requires "
-                "mask_sharing_mode='separate'."
+                'separate image/text edge weights.'
             )
         if (
             self.mask_specialization_mode == 'user_js'
@@ -273,6 +296,35 @@ class DUAL_MODALITY(GeneralRecommender):
             )
         if self.hard_mask_temperature <= 0.0:
             raise ValueError('hard_mask_temperature must be positive.')
+        if self.mask_weight_mode != 'sigmoid':
+            if self.mask_graph_mode != 'soft':
+                raise ValueError(
+                    'User-normalized mask weights require '
+                    "mask_graph_mode='soft'."
+                )
+            if self.mask_degree_mode != 'masked':
+                raise ValueError(
+                    'User-normalized mask weights require '
+                    "mask_degree_mode='masked'."
+                )
+            if self.mask_generation_mode != 'edge_logits':
+                raise ValueError(
+                    'User-normalized mask weights require '
+                    "mask_generation_mode='edge_logits'."
+                )
+            if self.mask_weight != 0.0:
+                raise ValueError(
+                    'Set mask_weight=0 for user-normalized weights; '
+                    'sigmoid budget/binary loss is not applicable.'
+                )
+            if (
+                self.mask_specialization_mode == 'user_js'
+                and self.mask_weight_mode != 'separate'
+            ):
+                raise ValueError(
+                    "user_js specialization requires mask_weight_mode="
+                    "'separate' for user-normalized weights."
+                )
         if self.v_feat is None or self.t_feat is None:
             raise ValueError(
                 'DUAL_MODALITY requires both visual and textual features.'
@@ -346,7 +398,40 @@ class DUAL_MODALITY(GeneralRecommender):
         initial_logit = math.log(
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
-        if self.mask_generation_mode == 'feature_network':
+        self.register_buffer(
+            'uniform_mask_logits',
+            torch.zeros(
+                self.num_interactions,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            persistent=False,
+        )
+        if self.mask_weight_mode == 'uniform':
+            self.register_parameter('shared_mask_logits', None)
+            self.register_parameter('image_mask_logits', None)
+            self.register_parameter('text_mask_logits', None)
+            self.image_mask_net = None
+            self.text_mask_net = None
+        elif self.mask_weight_mode == 'shared':
+            self.shared_mask_logits = nn.Parameter(
+                torch.zeros_like(self.uniform_mask_logits)
+            )
+            self.register_parameter('image_mask_logits', None)
+            self.register_parameter('text_mask_logits', None)
+            self.image_mask_net = None
+            self.text_mask_net = None
+        elif self.mask_weight_mode == 'separate':
+            self.register_parameter('shared_mask_logits', None)
+            self.image_mask_logits = nn.Parameter(
+                torch.zeros_like(self.uniform_mask_logits)
+            )
+            self.text_mask_logits = nn.Parameter(
+                torch.zeros_like(self.uniform_mask_logits)
+            )
+            self.image_mask_net = None
+            self.text_mask_net = None
+        elif self.mask_generation_mode == 'feature_network':
             self.register_parameter('shared_mask_logits', None)
             self.register_parameter('image_mask_logits', None)
             self.register_parameter('text_mask_logits', None)
@@ -369,6 +454,24 @@ class DUAL_MODALITY(GeneralRecommender):
                 self.register_parameter('shared_mask_logits', None)
                 self.image_mask_logits = nn.Parameter(mask_template.clone())
                 self.text_mask_logits = nn.Parameter(mask_template.clone())
+
+        if self.mask_weight_mode == 'sigmoid':
+            self.register_parameter('image_propagation_gamma_logit', None)
+            self.register_parameter('text_propagation_gamma_logit', None)
+        else:
+            gamma_logit = math.log(
+                self.mask_gamma_init / (1.0 - self.mask_gamma_init)
+            )
+            self.image_propagation_gamma_logit = nn.Parameter(
+                torch.tensor(
+                    gamma_logit, dtype=torch.float32, device=self.device
+                )
+            )
+            self.text_propagation_gamma_logit = nn.Parameter(
+                torch.tensor(
+                    gamma_logit, dtype=torch.float32, device=self.device
+                )
+            )
 
         for modality in ('shared', 'image', 'text'):
             for split in ('train', 'eval'):
@@ -595,6 +698,27 @@ class DUAL_MODALITY(GeneralRecommender):
             ),
         )
 
+    @property
+    def uses_user_normalized_weights(self):
+        return self.mask_weight_mode != 'sigmoid'
+
+    @property
+    def edge_weights_are_shared(self):
+        if self.uses_user_normalized_weights:
+            return self.mask_weight_mode in {'uniform', 'shared'}
+        return self.mask_sharing_mode == 'shared'
+
+    def _propagation_gamma(self, modality):
+        if not self.uses_user_normalized_weights:
+            return None
+        if modality == 'image':
+            logit = self.image_propagation_gamma_logit
+        elif modality == 'text':
+            logit = self.text_propagation_gamma_logit
+        else:
+            raise ValueError("modality must be 'image' or 'text'.")
+        return torch.sigmoid(logit)
+
     @torch.no_grad()
     def _sample_hard_indices(self, mask_logits):
         uniform_noise = torch.rand_like(mask_logits).clamp_(
@@ -647,8 +771,97 @@ class DUAL_MODALITY(GeneralRecommender):
                         '{}_hard_eval_indices'.format(modality),
                         self._select_hard_indices(mask_logits),
                     )
+        if self.uses_user_normalized_weights:
+            diagnostics = self.get_weight_diagnostics(refresh=False)
+            if diagnostics is not None:
+                image = diagnostics['relative_weights']['image']
+                text = diagnostics['relative_weights']['text']
+                return (
+                    'normalized mask weights '
+                    '[mode: {mode}, gamma_v: {gamma_v:.4f}, '
+                    'gamma_t: {gamma_t:.4f}, '
+                    'r_v mean/std/q05/q95: '
+                    '{iv_mean:.4f}/{iv_std:.4f}/{iv_q05:.4f}/{iv_q95:.4f}, '
+                    'r_t mean/std/q05/q95: '
+                    '{it_mean:.4f}/{it_std:.4f}/{it_q05:.4f}/{it_q95:.4f}, '
+                    'mean user JS(q_v,q_t): {js:.6f}]'
+                ).format(
+                    mode=diagnostics['mode'],
+                    gamma_v=diagnostics['gamma']['image'],
+                    gamma_t=diagnostics['gamma']['text'],
+                    iv_mean=image['mean'],
+                    iv_std=image['std'],
+                    iv_q05=image['q05'],
+                    iv_q95=image['q95'],
+                    it_mean=text['mean'],
+                    it_std=text['std'],
+                    it_q05=text['q05'],
+                    it_q95=text['q95'],
+                    js=diagnostics['mean_eligible_user_js'],
+                )
+        return None
 
-    def _normalize_adj_m(self, indices, adj_size, edge_weights=None):
+    @staticmethod
+    def _distribution_summary(values):
+        values = values.detach().float()
+        quantile_levels = values.new_tensor(
+            [0.05, 0.25, 0.5, 0.75, 0.95]
+        )
+        quantiles = torch.quantile(values, quantile_levels)
+        return {
+            'mean': float(values.mean().item()),
+            'std': float(values.std(unbiased=False).item()),
+            'min': float(values.min().item()),
+            'q05': float(quantiles[0].item()),
+            'q25': float(quantiles[1].item()),
+            'q50': float(quantiles[2].item()),
+            'q75': float(quantiles[3].item()),
+            'q95': float(quantiles[4].item()),
+            'max': float(values.max().item()),
+        }
+
+    @torch.no_grad()
+    def get_weight_diagnostics(self, refresh=True):
+        """Summarize gamma, relative weights r and per-user JS(q_v,q_t)."""
+        if not self.uses_user_normalized_weights:
+            return None
+        if refresh or self.latest_representations is None:
+            self.forward(self.norm_adj)
+        representations = self.latest_representations
+        _, per_user_js = self._user_distribution_specialization_loss(
+            representations['image_edge_distribution'],
+            representations['text_edge_distribution'],
+        )
+        eligible_js = per_user_js[self.specialization_user_mask]
+        mean_js = (
+            eligible_js.mean()
+            if eligible_js.numel() > 0
+            else per_user_js.new_zeros(())
+        )
+        return {
+            'mode': self.mask_weight_mode,
+            'gamma': {
+                'image': float(
+                    representations['image_propagation_gamma'].item()
+                ),
+                'text': float(
+                    representations['text_propagation_gamma'].item()
+                ),
+            },
+            'relative_weights': {
+                'image': self._distribution_summary(
+                    representations['image_relative_edge_weights']
+                ),
+                'text': self._distribution_summary(
+                    representations['text_relative_edge_weights']
+                ),
+            },
+            'mean_eligible_user_js': float(mean_js.item()),
+        }
+
+    def _normalize_adj_m(
+        self, indices, adj_size, edge_weights=None, eps=1e-7
+    ):
         if edge_weights is None:
             edge_weights = torch.ones(
                 indices.size(1), dtype=torch.float32, device=indices.device
@@ -662,13 +875,59 @@ class DUAL_MODALITY(GeneralRecommender):
         )
         user_degree.index_add_(0, users, edge_weights)
         item_degree.index_add_(0, items, edge_weights)
-        user_inv_sqrt = (user_degree + 1e-7).pow(-0.5)
-        item_inv_sqrt = (item_degree + 1e-7).pow(-0.5)
+        user_inv_sqrt = (user_degree + eps).pow(-0.5)
+        item_inv_sqrt = (item_degree + eps).pow(-0.5)
         return (
             user_inv_sqrt[users]
             * edge_weights
             * item_inv_sqrt[items]
         )
+
+    def _user_normalized_edge_weights(self, mask_logits):
+        """Return per-user edge distribution q and relative weights r=d_u*q."""
+        edge_users = self.edge_indices[0]
+        user_degrees = self.user_interaction_counts.to(
+            dtype=mask_logits.dtype
+        )
+        edge_degrees = user_degrees.index_select(0, edge_users)
+
+        if self.mask_weight_mode == 'uniform':
+            distribution = edge_degrees.reciprocal()
+        else:
+            # Subtracting a detached segment maximum gives a stable softmax;
+            # softmax is invariant to this shift, so gradients are unchanged.
+            user_max = mask_logits.new_full(
+                (self.n_users,), -torch.inf
+            )
+            user_max.scatter_reduce_(
+                0,
+                edge_users,
+                mask_logits.detach(),
+                reduce='amax',
+                include_self=True,
+            )
+            exponentials = torch.exp(
+                mask_logits - user_max.index_select(0, edge_users)
+            )
+            user_mass = mask_logits.new_zeros(self.n_users).index_add(
+                0, edge_users, exponentials
+            )
+            distribution = exponentials / user_mass.index_select(
+                0, edge_users
+            ).clamp_min(self.mask_weight_eps)
+
+        relative_weights = edge_degrees * distribution
+        return distribution, relative_weights
+
+    def _edge_mass_to_user_distribution(self, edge_mass):
+        """Normalize arbitrary positive edge mass inside each user history."""
+        edge_users = self.edge_indices[0]
+        user_mass = edge_mass.new_zeros(self.n_users).index_add(
+            0, edge_users, edge_mass
+        )
+        return edge_mass / user_mass.index_select(
+            0, edge_users
+        ).clamp_min(self.mask_weight_eps)
 
     def get_edge_info(self):
         rows = torch.from_numpy(
@@ -684,6 +943,16 @@ class DUAL_MODALITY(GeneralRecommender):
         return edges, values
 
     def _get_mask_logits(self, modality, item_features=None):
+        if self.mask_weight_mode == 'uniform':
+            return self.uniform_mask_logits
+        if self.mask_weight_mode == 'shared':
+            return self.shared_mask_logits
+        if self.mask_weight_mode == 'separate':
+            if modality == 'image':
+                return self.image_mask_logits
+            if modality == 'text':
+                return self.text_mask_logits
+            raise ValueError("modality must be 'image' or 'text'.")
         if self.mask_generation_mode == 'feature_network':
             if item_features is None:
                 raise ValueError(
@@ -703,6 +972,15 @@ class DUAL_MODALITY(GeneralRecommender):
     def _unique_mask_logits(
         self, image_features=None, text_features=None
     ):
+        if self.mask_weight_mode == 'uniform':
+            return (('shared', self.uniform_mask_logits),)
+        if self.mask_weight_mode == 'shared':
+            return (('shared', self.shared_mask_logits),)
+        if self.mask_weight_mode == 'separate':
+            return (
+                ('image', self.image_mask_logits),
+                ('text', self.text_mask_logits),
+            )
         if self.mask_generation_mode == 'feature_network':
             return (
                 (
@@ -727,7 +1005,7 @@ class DUAL_MODALITY(GeneralRecommender):
         generated_logits = dict(
             self._unique_mask_logits(image_features, text_features)
         )
-        if self.mask_sharing_mode == 'shared':
+        if 'shared' in generated_logits:
             return (('shared', generated_logits['shared']),)
         if self.mask_assignment_mode == 'swapped':
             return (
@@ -746,9 +1024,9 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError(
                 "mask assignment mode must be 'normal' or 'swapped'."
             )
-        if mode == 'swapped' and self.mask_sharing_mode != 'separate':
+        if mode == 'swapped' and self.edge_weights_are_shared:
             raise ValueError(
-                "Swapping masks requires mask_sharing_mode='separate'."
+                'Swapping masks requires separate image/text edge weights.'
             )
         self.mask_assignment_mode = mode
         for modality in ('shared', 'image', 'text'):
@@ -783,7 +1061,7 @@ class DUAL_MODALITY(GeneralRecommender):
         return self._assigned_mask_logits()
 
     def _current_hard_indices(self, modality, mask_logits):
-        if self.mask_sharing_mode == 'shared':
+        if self.edge_weights_are_shared:
             modality = 'shared'
         split = 'train' if self.training else 'eval'
         buffer_name = '{}_hard_{}_indices'.format(modality, split)
@@ -797,6 +1075,27 @@ class DUAL_MODALITY(GeneralRecommender):
         return indices
 
     def _masked_ui_adjacency(self, modality, mask_logits):
+        if self.uses_user_normalized_weights:
+            _, relative_weights = self._user_normalized_edge_weights(
+                mask_logits
+            )
+            one_direction_values = self._normalize_adj_m(
+                self.edge_indices,
+                torch.Size((self.n_users, self.n_items)),
+                relative_weights,
+                eps=self.mask_weight_eps,
+            )
+            values = torch.cat(
+                (one_direction_values, one_direction_values), dim=0
+            )
+            adjacency = torch.sparse_coo_tensor(
+                self.ui_edge_index,
+                values,
+                (self.n_nodes, self.n_nodes),
+                device=values.device,
+            ).coalesce()
+            return adjacency, relative_weights
+
         probabilities = torch.sigmoid(mask_logits)
         if self.mask_graph_mode == 'hard':
             kept = self._current_hard_indices(modality, mask_logits)
@@ -866,7 +1165,12 @@ class DUAL_MODALITY(GeneralRecommender):
         )
 
     @staticmethod
-    def _propagate_ui_graph(adjacency, initial_embeddings, n_layers):
+    def _propagate_ui_graph(
+        adjacency,
+        initial_embeddings,
+        n_layers,
+        propagation_scale=None,
+    ):
         adjacency = adjacency.coalesce()
         differentiable_adjacency = adjacency.requires_grad
         all_embeddings = [initial_embeddings]
@@ -880,6 +1184,8 @@ class DUAL_MODALITY(GeneralRecommender):
                 current_embeddings = torch.sparse.mm(
                     adjacency, current_embeddings
                 )
+            if propagation_scale is not None:
+                current_embeddings = propagation_scale * current_embeddings
             all_embeddings.append(current_embeddings)
         return torch.stack(all_embeddings, dim=1).mean(dim=1)
 
@@ -1037,7 +1343,7 @@ class DUAL_MODALITY(GeneralRecommender):
         assigned_mask_logits = dict(
             self._assigned_mask_logits(image_feats, text_feats)
         )
-        if self.mask_sharing_mode == 'shared':
+        if 'shared' in assigned_mask_logits:
             image_mask_logits = assigned_mask_logits['shared']
             text_mask_logits = assigned_mask_logits['shared']
         else:
@@ -1049,6 +1355,34 @@ class DUAL_MODALITY(GeneralRecommender):
         text_masked_adj, text_mask = self._masked_ui_adjacency(
             'text', text_mask_logits
         )
+        image_gamma = self._propagation_gamma('image')
+        text_gamma = self._propagation_gamma('text')
+        if self.uses_user_normalized_weights:
+            edge_user_degrees = self.user_interaction_counts.index_select(
+                0, self.edge_indices[0]
+            ).to(dtype=image_mask.dtype)
+            image_edge_distribution = image_mask / edge_user_degrees
+            text_edge_distribution = text_mask / edge_user_degrees
+            image_relative_weights = image_mask
+            text_relative_weights = text_mask
+        else:
+            image_edge_mass = image_mask + self.mask_specialization_eps
+            text_edge_mass = text_mask + self.mask_specialization_eps
+            image_edge_distribution = (
+                self._edge_mass_to_user_distribution(image_edge_mass)
+            )
+            text_edge_distribution = (
+                self._edge_mass_to_user_distribution(text_edge_mass)
+            )
+            edge_user_degrees = (
+                self.user_interaction_counts.index_select(
+                    0, self.edge_indices[0]
+                ).to(dtype=image_mask.dtype)
+            )
+            image_relative_weights = (
+                edge_user_degrees * image_edge_distribution
+            )
+            text_relative_weights = edge_user_degrees * text_edge_distribution
         full_initial = torch.cat(
             (image_full_initial, text_full_initial), dim=1
         )
@@ -1061,10 +1395,16 @@ class DUAL_MODALITY(GeneralRecommender):
             dim=1,
         )
         image_masked = self._propagate_ui_graph(
-            image_masked_adj, image_masked_initial, self.n_ui_layers
+            image_masked_adj,
+            image_masked_initial,
+            self.n_ui_layers,
+            propagation_scale=image_gamma,
         )
         text_masked = self._propagate_ui_graph(
-            text_masked_adj, text_masked_initial, self.n_ui_layers
+            text_masked_adj,
+            text_masked_initial,
+            self.n_ui_layers,
+            propagation_scale=text_gamma,
         )
 
         image_full_users, image_full_items = torch.split(
@@ -1197,6 +1537,20 @@ class DUAL_MODALITY(GeneralRecommender):
             'text_mask_logits': text_mask_logits,
             'image_mask': image_mask,
             'text_mask': text_mask,
+            'image_edge_distribution': image_edge_distribution,
+            'text_edge_distribution': text_edge_distribution,
+            'image_relative_edge_weights': image_relative_weights,
+            'text_relative_edge_weights': text_relative_weights,
+            'image_propagation_gamma': (
+                image_gamma
+                if image_gamma is not None
+                else image_mask.new_ones(())
+            ),
+            'text_propagation_gamma': (
+                text_gamma
+                if text_gamma is not None
+                else text_mask.new_ones(())
+            ),
         }
         return user_embeddings, final_item_embeddings
 
@@ -1209,33 +1563,44 @@ class DUAL_MODALITY(GeneralRecommender):
         self, image_mask_logits, text_mask_logits
     ):
         """Margin loss on per-user image/text edge distributions."""
-        edge_users = self.edge_indices[0]
         image_probabilities = torch.sigmoid(image_mask_logits)
         text_probabilities = torch.sigmoid(text_mask_logits)
         image_edge_mass = image_probabilities + self.mask_specialization_eps
         text_edge_mass = text_probabilities + self.mask_specialization_eps
+        image_distribution = self._edge_mass_to_user_distribution(
+            image_edge_mass
+        )
+        text_distribution = self._edge_mass_to_user_distribution(
+            text_edge_mass
+        )
+        return self._user_distribution_specialization_loss(
+            image_distribution, text_distribution
+        )
 
-        image_user_mass = image_edge_mass.new_zeros(self.n_users).index_add(
-            0, edge_users, image_edge_mass
-        )
-        text_user_mass = text_edge_mass.new_zeros(self.n_users).index_add(
-            0, edge_users, text_edge_mass
-        )
-        image_distribution = image_edge_mass / image_user_mass.index_select(
-            0, edge_users
-        )
-        text_distribution = text_edge_mass / text_user_mass.index_select(
-            0, edge_users
-        )
+    def _user_distribution_specialization_loss(
+        self, image_distribution, text_distribution
+    ):
+        """Margin loss and per-user JS for already normalized edge mass."""
+        edge_users = self.edge_indices[0]
         mixture_distribution = 0.5 * (
             image_distribution + text_distribution
-        )
+        ).clamp_min(self.mask_specialization_eps)
 
         edge_js = 0.5 * (
             image_distribution
-            * (image_distribution.log() - mixture_distribution.log())
+            * (
+                image_distribution.clamp_min(
+                    self.mask_specialization_eps
+                ).log()
+                - mixture_distribution.log()
+            )
             + text_distribution
-            * (text_distribution.log() - mixture_distribution.log())
+            * (
+                text_distribution.clamp_min(
+                    self.mask_specialization_eps
+                ).log()
+                - mixture_distribution.log()
+            )
         )
         per_user_js = edge_js.new_zeros(self.n_users).index_add(
             0, edge_users, edge_js
@@ -1243,7 +1608,7 @@ class DUAL_MODALITY(GeneralRecommender):
         eligible_js = per_user_js[self.specialization_user_mask]
         if eligible_js.numel() == 0:
             specialization_loss = (
-                image_mask_logits.sum() + text_mask_logits.sum()
+                image_distribution.sum() + text_distribution.sum()
             ) * 0.0
         else:
             specialization_loss = F.relu(
@@ -1378,31 +1743,54 @@ class DUAL_MODALITY(GeneralRecommender):
         else:
             contrastive_loss = ranking_loss.new_zeros(())
 
-        mask_losses = []
-        mask_means = []
-        for _, mask_logits in self._latest_unique_mask_logits():
-            probabilities = torch.sigmoid(mask_logits)
-            mask_mean = probabilities.mean()
-            budget_loss = (mask_mean - self.mask_keep_ratio).pow(2)
-            binary_loss = (probabilities * (1.0 - probabilities)).mean()
-            mask_losses.append(
-                budget_loss + self.mask_binary_weight * binary_loss
+        if self.uses_user_normalized_weights:
+            # q sums to one per user and r=d_u*q has mean one by
+            # construction, so the legacy sigmoid budget loss is undefined.
+            mask_loss = ranking_loss.new_zeros(())
+            mean_mask_probability = 0.5 * (
+                self.latest_representations[
+                    'image_relative_edge_weights'
+                ].mean()
+                + self.latest_representations[
+                    'text_relative_edge_weights'
+                ].mean()
             )
-            mask_means.append(mask_mean)
-        mask_loss = torch.stack(mask_losses).mean()
-        mean_mask_probability = torch.stack(mask_means).mean()
+        else:
+            mask_losses = []
+            mask_means = []
+            for _, mask_logits in self._latest_unique_mask_logits():
+                probabilities = torch.sigmoid(mask_logits)
+                mask_mean = probabilities.mean()
+                budget_loss = (mask_mean - self.mask_keep_ratio).pow(2)
+                binary_loss = (
+                    probabilities * (1.0 - probabilities)
+                ).mean()
+                mask_losses.append(
+                    budget_loss + self.mask_binary_weight * binary_loss
+                )
+                mask_means.append(mask_mean)
+            mask_loss = torch.stack(mask_losses).mean()
+            mean_mask_probability = torch.stack(mask_means).mean()
 
         if (
             self.mask_specialization_mode == 'user_js'
             and self.mask_specialization_weight > 0.0
         ):
             representations = self.latest_representations
-            specialization_loss, per_user_mask_js = (
-                self._user_mask_specialization_loss(
-                    representations['image_mask_logits'],
-                    representations['text_mask_logits'],
+            if self.uses_user_normalized_weights:
+                specialization_loss, per_user_mask_js = (
+                    self._user_distribution_specialization_loss(
+                        representations['image_edge_distribution'],
+                        representations['text_edge_distribution'],
+                    )
                 )
-            )
+            else:
+                specialization_loss, per_user_mask_js = (
+                    self._user_mask_specialization_loss(
+                        representations['image_mask_logits'],
+                        representations['text_mask_logits'],
+                    )
+                )
             eligible_user_mask_js = per_user_mask_js[
                 self.specialization_user_mask
             ]
@@ -1429,6 +1817,17 @@ class DUAL_MODALITY(GeneralRecommender):
             'contrastive': contrastive_loss.detach(),
             'mask': mask_loss.detach(),
             'mask_mean': mean_mask_probability.detach(),
+            'mean_relative_edge_weight': (
+                0.5
+                * (
+                    self.latest_representations[
+                        'image_relative_edge_weights'
+                    ].mean()
+                    + self.latest_representations[
+                        'text_relative_edge_weights'
+                    ].mean()
+                )
+            ).detach(),
             'mask_specialization': specialization_loss.detach(),
             'mean_user_mask_js': mean_user_mask_js.detach(),
         }
@@ -1514,22 +1913,64 @@ class DUAL_MODALITY(GeneralRecommender):
         representations = self.latest_representations
 
         masks = {}
-        for modality, logits in self._latest_unique_mask_logits():
-            selected_indices = self._select_hard_indices(logits)
-            selected = torch.zeros_like(logits, dtype=torch.bool)
-            selected[selected_indices] = True
-            masks[modality] = {
-                'logits': logits.detach().cpu(),
-                'probabilities': torch.sigmoid(logits).detach().cpu(),
-                'selected_at_keep_ratio': selected.detach().cpu(),
+        normalized_edge_weights = None
+        if self.uses_user_normalized_weights:
+            for modality in ('image', 'text'):
+                logits = representations[
+                    '{}_mask_logits'.format(modality)
+                ]
+                selected_indices = self._select_hard_indices(logits)
+                selected = torch.zeros_like(logits, dtype=torch.bool)
+                selected[selected_indices] = True
+                masks[modality] = {
+                    'logits': logits.detach().cpu(),
+                    'user_distribution_q': representations[
+                        '{}_edge_distribution'.format(modality)
+                    ].detach().cpu(),
+                    'relative_weights_r': representations[
+                        '{}_relative_edge_weights'.format(modality)
+                    ].detach().cpu(),
+                    'selected_at_keep_ratio': selected.detach().cpu(),
+                }
+            normalized_edge_weights = {
+                'gamma': {
+                    'image': representations[
+                        'image_propagation_gamma'
+                    ].detach().cpu(),
+                    'text': representations[
+                        'text_propagation_gamma'
+                    ].detach().cpu(),
+                },
+                'diagnostics': self.get_weight_diagnostics(refresh=False),
             }
+        else:
+            for modality, logits in self._latest_unique_mask_logits():
+                selected_indices = self._select_hard_indices(logits)
+                selected = torch.zeros_like(logits, dtype=torch.bool)
+                selected[selected_indices] = True
+                masks[modality] = {
+                    'logits': logits.detach().cpu(),
+                    'probabilities': torch.sigmoid(logits).detach().cpu(),
+                    'selected_at_keep_ratio': selected.detach().cpu(),
+                }
 
         mask_specialization = None
-        if self.mask_sharing_mode == 'separate':
-            latest_mask_logits = dict(self._latest_unique_mask_logits())
-            _, per_user_mask_js = self._user_mask_specialization_loss(
-                latest_mask_logits['image'], latest_mask_logits['text']
-            )
+        if not self.edge_weights_are_shared:
+            if self.uses_user_normalized_weights:
+                _, per_user_mask_js = (
+                    self._user_distribution_specialization_loss(
+                        representations['image_edge_distribution'],
+                        representations['text_edge_distribution'],
+                    )
+                )
+            else:
+                latest_mask_logits = dict(
+                    self._latest_unique_mask_logits()
+                )
+                _, per_user_mask_js = self._user_mask_specialization_loss(
+                    latest_mask_logits['image'],
+                    latest_mask_logits['text'],
+                )
             eligible_user_ids = torch.nonzero(
                 self.specialization_user_mask, as_tuple=False
             ).squeeze(1)
@@ -1553,6 +1994,9 @@ class DUAL_MODALITY(GeneralRecommender):
                 'model': self.__class__.__name__,
                 'ui_branch_mode': 'four_branch_dual_modality',
                 'mask_graph_mode': self.mask_graph_mode,
+                'mask_weight_mode': self.mask_weight_mode,
+                'mask_gamma_init': self.mask_gamma_init,
+                'mask_weight_eps': self.mask_weight_eps,
                 'mask_generation_mode': self.mask_generation_mode,
                 'mask_hidden_dim': self.mask_hidden_dim,
                 'mask_sharing_mode': self.mask_sharing_mode,
@@ -1588,6 +2032,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'item_ids': self.edge_indices[1].detach().cpu(),
             },
             'masks': masks,
+            'normalized_edge_weights': normalized_edge_weights,
             'mask_specialization': mask_specialization,
             'embedding_tables': {
                 'user_image.weight': self.user_image.weight.detach().cpu(),
@@ -1613,6 +2058,12 @@ class DUAL_MODALITY(GeneralRecommender):
                     'text_mask',
                     'image_mask_logits',
                     'text_mask_logits',
+                    'image_edge_distribution',
+                    'text_edge_distribution',
+                    'image_relative_edge_weights',
+                    'text_relative_edge_weights',
+                    'image_propagation_gamma',
+                    'text_propagation_gamma',
                 }
             },
         }

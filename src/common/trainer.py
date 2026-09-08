@@ -161,11 +161,16 @@ class Trainer(AbstractTrainer):
         os.replace(temporary_file, file_path)
 
     def _save_best_checkpoint(
-        self, epoch_idx, valid_result, test_result
+        self, epoch_idx, valid_result, test_result, epoch_timing=None
     ):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         saved_valid_result = self._serializable_config_value(valid_result)
         saved_test_result = self._serializable_config_value(test_result)
+        model_diagnostics = None
+        if hasattr(self.model, 'get_weight_diagnostics'):
+            model_diagnostics = self.model.get_weight_diagnostics(
+                refresh=False
+            )
         checkpoint = {
             'epoch': epoch_idx,
             'best_valid_score': float(self.best_valid_score),
@@ -175,6 +180,8 @@ class Trainer(AbstractTrainer):
             'optimizer_state_dict': self.optimizer.state_dict(),
             'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
             'config': self._checkpoint_config(),
+            'epoch_timing': epoch_timing,
+            'model_diagnostics': model_diagnostics,
         }
         self._atomic_torch_save(checkpoint, self.saved_model_file)
         self.logger.info(
@@ -201,6 +208,8 @@ class Trainer(AbstractTrainer):
             'test_result_upon_best_valid': saved_test_result,
             'checkpoint_file': self.saved_model_file,
             'config': self._checkpoint_config(),
+            'epoch_timing': epoch_timing,
+            'model_diagnostics': model_diagnostics,
         })
         self._atomic_torch_save(analysis, self.analysis_file)
         self.logger.info(
@@ -384,11 +393,17 @@ class Trainer(AbstractTrainer):
                                      (epoch_idx, valid_end_time - valid_start_time, valid_score)
                 valid_result_output = 'valid result: \n' + dict2str(valid_result)
                 # test
+                test_start_time = time()
                 _, test_result = self._valid_epoch(test_data)
+                test_end_time = time()
                 if verbose:
                     self.logger.info(valid_score_output)
                     self.logger.info(valid_result_output)
-                    self.logger.info('test result: \n' + dict2str(test_result))
+                    self.logger.info(
+                        'test result [time: %.2fs]: \n%s',
+                        test_end_time - test_start_time,
+                        dict2str(test_result),
+                    )
                 if update_flag:
                     update_output = '██ ' + self.config['model'] + '--Best validation results updated!!!'
                     if verbose:
@@ -398,7 +413,21 @@ class Trainer(AbstractTrainer):
                     self.best_epoch = epoch_idx
                     if saved:
                         self._save_best_checkpoint(
-                            epoch_idx, valid_result, test_result
+                            epoch_idx,
+                            valid_result,
+                            test_result,
+                            epoch_timing={
+                                'training_seconds': (
+                                    training_end_time
+                                    - training_start_time
+                                ),
+                                'validation_seconds': (
+                                    valid_end_time - valid_start_time
+                                ),
+                                'test_seconds': (
+                                    test_end_time - test_start_time
+                                ),
+                            },
                         )
 
                 if stop_flag:

@@ -14,11 +14,23 @@ mm_graph_mode: separate
 # Used only by mixed mode to build alpha*A_image + (1-alpha)*A_text.
 mm_image_weight: 0.1
 
-# feature_network: logits come from f_m([user || item || user*item]).
-# edge_logits: learn one free logit per observed U-I edge.
-mask_generation_mode: feature_network
+# User-normalized relative-edge-weight ablations:
+# uniform: r_ui=1, with no learnable edge logits.
+# shared: one learnable edge-logit table is shared by image and text.
+# separate: independent image/text edge-logit tables.
+# sigmoid: legacy sigmoid mask behavior configured by the options below.
+mask_weight_mode: separate
+# gamma is learned independently for image/text and applied at every masked
+# propagation step. The same initialization should be used across ablations.
+mask_gamma_init: 0.5
+mask_weight_eps: 1.0e-7
+
+# Normalized uniform/shared/separate modes require edge_logits. In legacy
+# sigmoid mode, feature_network computes f_m([user || item || user*item]).
+mask_generation_mode: edge_logits
 mask_hidden_dim: 64
 
+# Legacy sigmoid option; normalized modes derive sharing from mask_weight_mode.
 # Feature-network mode uses independent image/text mask networks.
 mask_sharing_mode: separate
 # normal during training; the checkpoint swap-analysis script changes this
@@ -30,18 +42,22 @@ mask_assignment_mode: normal
 fusion_gate_mode: shared
 
 # Each modality has a full and a masked U-I branch.
-mask_graph_mode: hard
-mask_degree_mode: full
+mask_graph_mode: soft
+mask_degree_mode: masked
+# keep_ratio/binary_weight are only used by legacy sigmoid masking (apart
+# from the optional top-k proxy stored for analysis).
 mask_keep_ratio: 0.3
 hard_mask_temperature: 1.0
-mask_weight: 0.1
+# Keep this at zero for user-normalized modes: q already sums to one inside
+# each user's history and r=d_u*q has global mean one.
+mask_weight: 0.0
 mask_binary_weight: 0.1
 
-# user_js: enforce a minimum JS divergence between image/text edge-choice
-# distributions inside each user history (users with at least two edges only).
-# none or a zero weight disables the specialization loss.
-mask_specialization_mode: user_js
-mask_specialization_weight: 0.1
+# user_js is available only for separate image/text edge weights. Leave it
+# disabled when comparing uniform/shared/separate so the ablations differ
+# only in their edge-weight parameterization; JS is still logged either way.
+mask_specialization_mode: none
+mask_specialization_weight: 0.0
 mask_specialization_margin: 0.1
 mask_specialization_eps: 1.0e-8
 

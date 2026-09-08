@@ -29,19 +29,36 @@ def load_raw_features(config, train_dataset):
 @torch.no_grad()
 def collect_mask_snapshot(model):
     """Collect probabilities and exact hard selections (or soft top-k proxy)."""
-    if model.mask_sharing_mode != 'separate':
+    if model.edge_weights_are_shared:
         raise ValueError('Mask analysis requires separate image/text masks.')
     model.eval()
     model.set_mask_assignment_mode('normal')
     model.forward(model.norm_adj)
     representations = model.latest_representations
 
-    probabilities = {
-        modality: torch.sigmoid(
-            representations['{}_mask_logits'.format(modality)]
-        ).detach().cpu()
-        for modality in ('image', 'text')
-    }
+    if model.uses_user_normalized_weights:
+        probabilities = {
+            modality: representations[
+                '{}_edge_distribution'.format(modality)
+            ].detach().cpu()
+            for modality in ('image', 'text')
+        }
+        relative_weights = {
+            modality: representations[
+                '{}_relative_edge_weights'.format(modality)
+            ].detach().cpu()
+            for modality in ('image', 'text')
+        }
+        weight_semantics = 'per_user_distribution_q'
+    else:
+        probabilities = {
+            modality: torch.sigmoid(
+                representations['{}_mask_logits'.format(modality)]
+            ).detach().cpu()
+            for modality in ('image', 'text')
+        }
+        relative_weights = None
+        weight_semantics = 'sigmoid_probability'
     selections = {}
     if model.mask_graph_mode == 'hard':
         for modality in ('image', 'text'):
@@ -72,6 +89,8 @@ def collect_mask_snapshot(model):
         'edge_users': model.edge_indices[0].detach().cpu(),
         'edge_items': model.edge_indices[1].detach().cpu(),
         'probabilities': probabilities,
+        'relative_weights': relative_weights,
+        'weight_semantics': weight_semantics,
         'selected': selections,
         'selection_kind': selection_kind,
     }
@@ -156,6 +175,25 @@ def _rank_discrepancy(
     return normalized_rank_gap, rank_correlation
 
 
+def _per_user_probability_statistics(
+    user_positions, probabilities, num_users
+):
+    result = {
+        statistic: np.full(num_users, np.nan, dtype=np.float64)
+        for statistic in ('mean', 'std', 'q25', 'q50', 'q75')
+    }
+    for user, positions in enumerate(user_positions):
+        if positions.size == 0:
+            continue
+        values = probabilities[positions]
+        result['mean'][user] = values.mean()
+        result['std'][user] = values.std()
+        result['q25'][user], result['q50'][user], result['q75'][user] = (
+            np.quantile(values, [0.25, 0.5, 0.75])
+        )
+    return result
+
+
 def per_user_mask_statistics(snapshot, num_users, eps=1e-8):
     edge_users = snapshot['edge_users'].numpy()
     image_probabilities = snapshot['probabilities']['image'].numpy()
@@ -217,6 +255,12 @@ def per_user_mask_statistics(snapshot, num_users, eps=1e-8):
         num_users,
         eps,
     )
+    image_probability_statistics = _per_user_probability_statistics(
+        user_positions, image_probabilities, num_users
+    )
+    text_probability_statistics = _per_user_probability_statistics(
+        user_positions, text_probabilities, num_users
+    )
 
     if np.std(image_probabilities) == 0.0 or np.std(text_probabilities) == 0.0:
         global_probability_correlation = np.nan
@@ -236,6 +280,8 @@ def per_user_mask_statistics(snapshot, num_users, eps=1e-8):
         'per_user_js': per_user_js,
         'normalized_rank_gap': normalized_rank_gap,
         'rank_correlation': rank_correlation,
+        'image_probability_statistics': image_probability_statistics,
+        'text_probability_statistics': text_probability_statistics,
         'global_probability_correlation': global_probability_correlation,
         'group_masks': group_masks,
         'group_counts': group_counts,
@@ -365,7 +411,10 @@ def controlled_propagation_effects(model):
             modality, mask_logits
         )
         masked_output = model._propagate_ui_graph(
-            masked_adjacency, initial, model.n_ui_layers
+            masked_adjacency,
+            initial,
+            model.n_ui_layers,
+            propagation_scale=model._propagation_gamma(modality),
         )
         results[modality] = {
             'masked': _representation_change(
@@ -376,28 +425,43 @@ def controlled_propagation_effects(model):
 
         if (
             model.mask_graph_mode == 'soft'
-            and model.mask_degree_mode == 'full'
+            and (
+                model.mask_degree_mode == 'full'
+                or model.uses_user_normalized_weights
+            )
         ):
-            probability = torch.sigmoid(mask_logits).mean().clamp(
-                1e-6, 1.0 - 1e-6
-            )
-            constant_logit = torch.log(probability / (1.0 - probability))
-            constant_logits = torch.full_like(
-                mask_logits, float(constant_logit.item())
-            )
+            if model.uses_user_normalized_weights:
+                constant_logits = torch.zeros_like(mask_logits)
+                constant_probability = None
+            else:
+                probability = torch.sigmoid(mask_logits).mean().clamp(
+                    1e-6, 1.0 - 1e-6
+                )
+                constant_logit = torch.log(
+                    probability / (1.0 - probability)
+                )
+                constant_logits = torch.full_like(
+                    mask_logits, float(constant_logit.item())
+                )
+                constant_probability = float(probability.item())
             constant_adjacency, _ = model._masked_ui_adjacency(
                 modality, constant_logits
             )
             constant_output = model._propagate_ui_graph(
-                constant_adjacency, initial, model.n_ui_layers
+                constant_adjacency,
+                initial,
+                model.n_ui_layers,
+                propagation_scale=model._propagation_gamma(modality),
             )
             results[modality]['constant_mask'] = _representation_change(
                 full_output[:model.n_users],
                 constant_output[:model.n_users],
             )
-            results[modality]['constant_probability'] = float(
-                probability.item()
-            )
+            results[modality][
+                'constant_probability'
+            ] = constant_probability
+            if model.uses_user_normalized_weights:
+                results[modality]['constant_relative_weight'] = 1.0
     return results
 
 
@@ -416,6 +480,7 @@ def mask_intervention(model, intervention='original', seed=2024):
     """Temporarily alter only mask routing/edge assignment for evaluation."""
     valid = {
         'original',
+        'constant_mask',
         'permute_image',
         'permute_text',
         'permute_both',
@@ -424,8 +489,12 @@ def mask_intervention(model, intervention='original', seed=2024):
     }
     if intervention not in valid:
         raise ValueError('Unknown mask intervention: {}'.format(intervention))
-    if model.mask_sharing_mode != 'separate':
+    if model.edge_weights_are_shared:
         raise ValueError('Mask interventions require separate masks.')
+    if intervention == 'constant_mask' and model.mask_graph_mode != 'soft':
+        raise ValueError(
+            'constant_mask intervention requires mask_graph_mode=soft.'
+        )
 
     previous_assignment = model.mask_assignment_mode
     had_assigned_override = '_assigned_mask_logits' in model.__dict__
@@ -435,7 +504,25 @@ def mask_intervention(model, intervention='original', seed=2024):
     original_assigned = model._assigned_mask_logits
     model.set_mask_assignment_mode('normal')
 
-    if intervention == 'swapped':
+    if intervention == 'constant_mask':
+        def constant_logits(image_features=None, text_features=None):
+            logits = dict(
+                original_assigned(image_features, text_features)
+            )
+            result = []
+            for modality in ('image', 'text'):
+                probability = torch.sigmoid(logits[modality]).mean().clamp(
+                    1e-6, 1.0 - 1e-6
+                )
+                logit = torch.log(probability / (1.0 - probability))
+                result.append((
+                    modality,
+                    torch.full_like(logits[modality], float(logit.item())),
+                ))
+            return tuple(result)
+
+        model._assigned_mask_logits = constant_logits
+    elif intervention == 'swapped':
         model.set_mask_assignment_mode('swapped')
     elif intervention.startswith('permute_'):
         permutation = _within_user_permutation(model.edge_indices[0], seed)
@@ -532,12 +619,40 @@ def evaluate_intervention(
     with mask_intervention(model, intervention, seed):
         metrics, rankings = evaluate_topk(model, eval_data, config)
         triplet_result = triplet_diagnostics(model, triplets)
+        representations = model.latest_representations
+        if model.uses_user_normalized_weights:
+            mask_probability_means = {
+                modality: float(
+                    representations[
+                        '{}_edge_distribution'.format(modality)
+                    ].mean().item()
+                )
+                for modality in ('image', 'text')
+            }
+            relative_weight_means = {
+                modality: float(
+                    representations[
+                        '{}_relative_edge_weights'.format(modality)
+                    ].mean().item()
+                )
+                for modality in ('image', 'text')
+            }
+        else:
+            mask_probability_means = {
+                modality: float(torch.sigmoid(
+                    representations['{}_mask_logits'.format(modality)]
+                ).mean().item())
+                for modality in ('image', 'text')
+            }
+            relative_weight_means = None
     return {
         'intervention': intervention,
         'seed': int(seed),
         'metrics': metrics,
         'rankings': rankings,
         'triplets': triplet_result,
+        'mask_probability_means': mask_probability_means,
+        'relative_weight_means': relative_weight_means,
     }
 
 

@@ -110,6 +110,11 @@ class DualModalityTest(unittest.TestCase):
         mask_specialization_weight=0.0,
         mask_specialization_margin=0.1,
         mask_specialization_eps=1e-8,
+        mask_weight_mode='sigmoid',
+        mask_gamma_init=0.5,
+        mask_weight_eps=1e-7,
+        mask_degree_mode='full',
+        mask_weight=0.1,
     ):
         return NullableConfig(
             {
@@ -138,12 +143,15 @@ class DualModalityTest(unittest.TestCase):
                 'mask_specialization_weight': mask_specialization_weight,
                 'mask_specialization_margin': mask_specialization_margin,
                 'mask_specialization_eps': mask_specialization_eps,
+                'mask_weight_mode': mask_weight_mode,
+                'mask_gamma_init': mask_gamma_init,
+                'mask_weight_eps': mask_weight_eps,
                 'fusion_gate_mode': fusion_gate_mode,
                 'mask_graph_mode': mask_graph_mode,
-                'mask_degree_mode': 'full',
+                'mask_degree_mode': mask_degree_mode,
                 'mask_keep_ratio': 0.3,
                 'hard_mask_temperature': 1.0,
-                'mask_weight': 0.1,
+                'mask_weight': mask_weight,
                 'mask_binary_weight': 0.1,
                 'cl_weight': cl_weight,
                 'cl_mode': cl_mode,
@@ -171,6 +179,11 @@ class DualModalityTest(unittest.TestCase):
         mask_specialization_weight=0.0,
         mask_specialization_margin=0.1,
         mask_specialization_eps=1e-8,
+        mask_weight_mode='sigmoid',
+        mask_gamma_init=0.5,
+        mask_weight_eps=1e-7,
+        mask_degree_mode='full',
+        mask_weight=0.1,
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -189,6 +202,11 @@ class DualModalityTest(unittest.TestCase):
                 mask_specialization_weight,
                 mask_specialization_margin,
                 mask_specialization_eps,
+                mask_weight_mode,
+                mask_gamma_init,
+                mask_weight_eps,
+                mask_degree_mode,
+                mask_weight,
             ),
             FakeTrainData(),
         )
@@ -1227,6 +1245,10 @@ class DualModalityTest(unittest.TestCase):
             )
 
             self.assertEqual(snapshot['selection_kind'], 'exact_hard_mask')
+            self.assertEqual(
+                statistics['image_probability_statistics']['mean'].shape,
+                (model.n_users,),
+            )
             self.assertEqual(len(baselines), 5)
             for baseline in baselines:
                 self.assertAlmostEqual(
@@ -1241,6 +1263,11 @@ class DualModalityTest(unittest.TestCase):
                         statistics['degree'] > 0
                     ].mean(),
                 )
+            with self.assertRaisesRegex(
+                ValueError, 'requires mask_graph_mode=soft'
+            ):
+                with mask_intervention(model, 'constant_mask'):
+                    pass
 
     def test_mask_analysis_permutation_stays_within_each_user(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1297,6 +1324,35 @@ class DualModalityTest(unittest.TestCase):
                         values = effects[modality][control][metric]
                         self.assertEqual(values.shape, (model.n_users,))
                         self.assertTrue(np.isfinite(values).all())
+
+            model.forward(model.norm_adj)
+            learned_probability_means = {
+                modality: torch.sigmoid(
+                    model.latest_representations[
+                        '{}_mask_logits'.format(modality)
+                    ]
+                ).mean()
+                for modality in ('image', 'text')
+            }
+            with torch.no_grad(), mask_intervention(
+                model, 'constant_mask'
+            ):
+                model.forward(model.norm_adj)
+                for modality in ('image', 'text'):
+                    probabilities = torch.sigmoid(
+                        model.latest_representations[
+                            '{}_mask_logits'.format(modality)
+                        ]
+                    )
+                    torch.testing.assert_close(
+                        probabilities,
+                        torch.full_like(
+                            probabilities,
+                            float(
+                                learned_probability_means[modality].item()
+                            ),
+                        ),
+                    )
 
             with torch.no_grad(), mask_intervention(
                 model, 'full_adjacency'
@@ -1371,6 +1427,209 @@ class DualModalityTest(unittest.TestCase):
             expected_users, expected_items = model.forward(model.norm_adj)
             torch.testing.assert_close(actual_users, expected_users)
             torch.testing.assert_close(actual_items, expected_items)
+
+    def test_separate_user_normalized_weights_and_gamma_propagation(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='edge_logits',
+                mask_weight_mode='separate',
+                mask_gamma_init=0.5,
+                mask_degree_mode='masked',
+                mask_weight=0.0,
+            )
+
+            image_q, image_r = model._user_normalized_edge_weights(
+                model.image_mask_logits
+            )
+            text_q, text_r = model._user_normalized_edge_weights(
+                model.text_mask_logits
+            )
+            expected_q = model.user_interaction_counts.index_select(
+                0, model.edge_indices[0]
+            ).float().reciprocal()
+            torch.testing.assert_close(image_q, expected_q)
+            torch.testing.assert_close(text_q, expected_q)
+            torch.testing.assert_close(image_r, torch.ones_like(image_r))
+            torch.testing.assert_close(text_r, torch.ones_like(text_r))
+
+            image_adj, _ = model._masked_ui_adjacency(
+                'image', model.image_mask_logits
+            )
+            torch.testing.assert_close(
+                image_adj.to_dense(), model.norm_adj.to_dense()
+            )
+            self.assertAlmostEqual(
+                model._propagation_gamma('image').item(), 0.5
+            )
+            self.assertAlmostEqual(
+                model._propagation_gamma('text').item(), 0.5
+            )
+
+            initial = torch.randn(model.n_nodes, model.embedding_dim)
+            gamma = model._propagation_gamma('image')
+            first = torch.sparse.mm(image_adj, initial)
+            second = torch.sparse.mm(image_adj, gamma * first)
+            expected = (
+                initial + gamma * first + gamma * second
+            ) / 3.0
+            actual = model._propagate_ui_graph(
+                image_adj,
+                initial,
+                2,
+                propagation_scale=gamma,
+            )
+            torch.testing.assert_close(actual, expected)
+
+            loss = model.calculate_loss(self.interaction())
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            for parameter in (
+                model.image_mask_logits,
+                model.text_mask_logits,
+                model.image_propagation_gamma_logit,
+                model.text_propagation_gamma_logit,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['mask_weight_mode'], 'separate'
+            )
+            self.assertIn('normalized_edge_weights', artifacts)
+            for modality in ('image', 'text'):
+                self.assertIn(
+                    'user_distribution_q', artifacts['masks'][modality]
+                )
+                self.assertIn(
+                    'relative_weights_r', artifacts['masks'][modality]
+                )
+            diagnostics = artifacts['normalized_edge_weights'][
+                'diagnostics'
+            ]
+            self.assertEqual(diagnostics['mode'], 'separate')
+            self.assertIn('mean_eligible_user_js', diagnostics)
+            self.assertIn('normalized mask weights', model.post_epoch_processing())
+
+            snapshot = collect_mask_snapshot(model)
+            self.assertEqual(
+                snapshot['weight_semantics'], 'per_user_distribution_q'
+            )
+            self.assertIsNotNone(snapshot['relative_weights'])
+            effects = controlled_propagation_effects(model)
+            self.assertIn('constant_mask', effects['image'])
+            self.assertEqual(
+                effects['image']['constant_relative_weight'], 1.0
+            )
+
+            restored = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='edge_logits',
+                mask_weight_mode='separate',
+                mask_gamma_init=0.5,
+                mask_degree_mode='masked',
+                mask_weight=0.0,
+            )
+            restored.load_state_dict(model.state_dict())
+            restored.eval()
+            model.eval()
+            actual_users, actual_items = restored.forward(restored.norm_adj)
+            expected_users, expected_items = model.forward(model.norm_adj)
+            torch.testing.assert_close(actual_users, expected_users)
+            torch.testing.assert_close(actual_items, expected_items)
+
+    def test_shared_and_uniform_user_normalized_ablation_parameters(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            shared = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='edge_logits',
+                mask_weight_mode='shared',
+                mask_degree_mode='masked',
+                mask_weight=0.0,
+            )
+            self.assertIsNotNone(shared.shared_mask_logits)
+            self.assertIsNone(shared.image_mask_logits)
+            self.assertIsNone(shared.text_mask_logits)
+            shared.forward(shared.norm_adj)
+            torch.testing.assert_close(
+                shared.latest_representations['image_edge_distribution'],
+                shared.latest_representations['text_edge_distribution'],
+            )
+            self.assertIsNot(
+                shared.image_propagation_gamma_logit,
+                shared.text_propagation_gamma_logit,
+            )
+
+            uniform = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='edge_logits',
+                mask_weight_mode='uniform',
+                mask_degree_mode='masked',
+                mask_weight=0.0,
+            )
+            parameter_names = dict(uniform.named_parameters())
+            self.assertNotIn('shared_mask_logits', parameter_names)
+            self.assertNotIn('image_mask_logits', parameter_names)
+            self.assertNotIn('text_mask_logits', parameter_names)
+            _, relative_weights = uniform._user_normalized_edge_weights(
+                uniform.uniform_mask_logits
+            )
+            torch.testing.assert_close(
+                relative_weights, torch.ones_like(relative_weights)
+            )
+
+    def test_user_normalized_weighted_degree_matches_reference(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='edge_logits',
+                mask_weight_mode='separate',
+                mask_degree_mode='masked',
+                mask_weight=0.0,
+            )
+            with torch.no_grad():
+                model.image_mask_logits.copy_(
+                    torch.linspace(-1.5, 1.5, model.num_interactions)
+                )
+            q, relative_weights = model._user_normalized_edge_weights(
+                model.image_mask_logits
+            )
+            user_sums = torch.zeros(model.n_users).index_add_(
+                0, model.edge_indices[0], q
+            )
+            torch.testing.assert_close(
+                user_sums[model.user_interaction_counts > 0],
+                torch.ones_like(user_sums[model.user_interaction_counts > 0]),
+            )
+
+            users, items = model.edge_indices
+            user_degree = torch.zeros(model.n_users).index_add_(
+                0, users, relative_weights
+            )
+            item_degree = torch.zeros(model.n_items).index_add_(
+                0, items, relative_weights
+            )
+            expected_values = relative_weights / torch.sqrt(
+                (user_degree[users] + model.mask_weight_eps)
+                * (item_degree[items] + model.mask_weight_eps)
+            )
+            adjacency, returned_weights = model._masked_ui_adjacency(
+                'image', model.image_mask_logits
+            )
+            torch.testing.assert_close(returned_weights, relative_weights)
+            torch.testing.assert_close(
+                adjacency.values()[:model.num_interactions],
+                expected_values,
+            )
 
 
 if __name__ == '__main__':

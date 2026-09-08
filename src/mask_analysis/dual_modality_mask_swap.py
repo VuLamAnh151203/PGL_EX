@@ -121,10 +121,10 @@ def main():
     config, model, train_dataset, valid_dataset, test_dataset = (
         _load_checkpoint(args.checkpoint, args.cpu)
     )
-    if model.mask_sharing_mode != 'separate':
+    if model.edge_weights_are_shared:
         raise ValueError(
-            'Mask-swap evaluation requires mask_sharing_mode=separate; '
-            'a shared image/text mask cannot be swapped.'
+            'Mask-swap evaluation requires separate image/text edge '
+            'weights; shared or uniform weights cannot be swapped.'
         )
     if args.topk is not None:
         config['topk'] = args.topk
