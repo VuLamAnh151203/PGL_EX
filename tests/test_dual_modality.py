@@ -783,6 +783,79 @@ class DualModalityTest(unittest.TestCase):
                 artifacts['metadata']['cl_mode'], 'full_masked_concat'
             )
 
+    def test_full_masked_per_modality_cl_uses_four_branch_pairs(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                cl_weight=0.1,
+                mask_sharing_mode='separate',
+                fusion_gate_mode='shared',
+                cl_mode='full_masked_per_modality',
+            )
+            interaction = self.interaction()
+            original_info_nce = model.symmetric_info_nce
+            with mock.patch.object(
+                model.dropoutf,
+                'forward',
+                side_effect=AssertionError(
+                    'Per-modality CL must not create dropout views.'
+                ),
+            ), mock.patch.object(
+                model, 'symmetric_info_nce', wraps=original_info_nce
+            ) as info_nce:
+                loss = model.calculate_loss(interaction)
+
+            self.assertTrue(torch.isfinite(loss))
+            self.assertEqual(info_nce.call_count, 4)
+            representations = model.latest_representations
+            unique_users = torch.unique(interaction[0])
+            unique_items = torch.unique(interaction[1])
+            expected_pairs = (
+                (
+                    representations['image_full_users'][unique_users],
+                    representations['image_masked_users'][unique_users],
+                ),
+                (
+                    representations['text_full_users'][unique_users],
+                    representations['text_masked_users'][unique_users],
+                ),
+                (
+                    representations['image_full_items'][unique_items],
+                    representations['image_masked_items'][unique_items],
+                ),
+                (
+                    representations['text_full_items'][unique_items],
+                    representations['text_masked_items'][unique_items],
+                ),
+            )
+            expected_terms = []
+            for call, expected_pair in zip(
+                info_nce.call_args_list, expected_pairs
+            ):
+                torch.testing.assert_close(call.args[0], expected_pair[0])
+                torch.testing.assert_close(call.args[1], expected_pair[1])
+                self.assertEqual(call.args[0].shape[1], 2)
+                expected_terms.append(original_info_nce(*expected_pair))
+            expected_cl = 0.25 * sum(expected_terms)
+            torch.testing.assert_close(
+                model.latest_loss_components['contrastive'],
+                expected_cl.detach(),
+            )
+
+            loss.backward()
+            self.assertTrue(
+                torch.isfinite(model.image_mask_logits.grad).all()
+            )
+            self.assertTrue(
+                torch.isfinite(model.text_mask_logits.grad).all()
+            )
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['cl_mode'],
+                'full_masked_per_modality',
+            )
+
     def test_modality_aux_bpr_and_score_diagnostics(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_features(root)

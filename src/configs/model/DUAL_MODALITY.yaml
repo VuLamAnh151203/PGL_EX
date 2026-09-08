@@ -43,9 +43,10 @@ mask_specialization_margin: 0.1
 mask_specialization_eps: 1.0e-8
 
 # full_masked_concat: CL between concat(image, text) full/masked views.
+# full_masked_per_modality: four separate user/item image/text SymNCE terms.
 # pgl_dropout: original PGL dropout-view CL on the final embeddings.
 # cl_weight: 0 disables InfoNCE completely in either mode.
-cl_mode: full_masked_concat
+cl_mode: full_masked_per_modality
 cl_weight: 0.1
 cl_temperature: 0.2
 dropout: 0.2

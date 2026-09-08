@@ -196,10 +196,14 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('mask_specialization_eps must be positive.')
         if self.cl_weight < 0.0 or self.cl_temperature <= 0.0:
             raise ValueError('Invalid contrastive-learning configuration.')
-        if self.cl_mode not in {'pgl_dropout', 'full_masked_concat'}:
+        if self.cl_mode not in {
+            'pgl_dropout',
+            'full_masked_concat',
+            'full_masked_per_modality',
+        }:
             raise ValueError(
-                "cl_mode must be 'pgl_dropout' or "
-                "'full_masked_concat'."
+                "cl_mode must be 'pgl_dropout', 'full_masked_concat', "
+                "or 'full_masked_per_modality'."
             )
         if self.aux_bpr_mode not in {
             'none', 'modality', 'masked_branch'
@@ -1257,19 +1261,48 @@ class DUAL_MODALITY(GeneralRecommender):
             #         self.cl_temperature,
             #     )
 
-            if self.cl_mode == 'full_masked_concat':
+            if self.cl_mode in {
+                'full_masked_concat', 'full_masked_per_modality'
+            }:
                 representations = self.latest_representations
                 unique_users = torch.unique(users)
                 unique_items = torch.unique(pos_items)
 
-                user_cl_loss = self.symmetric_info_nce(
-                    representations['full_users'][unique_users],
-                    representations['masked_users'][unique_users],
-                )
-                item_cl_loss = self.symmetric_info_nce(
-                    representations['full_items'][unique_items],
-                    representations['masked_items'][unique_items],
-                )
+                if self.cl_mode == 'full_masked_per_modality':
+                    image_user_cl_loss = self.symmetric_info_nce(
+                        representations['image_full_users'][unique_users],
+                        representations['image_masked_users'][unique_users],
+                    )
+                    text_user_cl_loss = self.symmetric_info_nce(
+                        representations['text_full_users'][unique_users],
+                        representations['text_masked_users'][unique_users],
+                    )
+                    image_item_cl_loss = self.symmetric_info_nce(
+                        representations['image_full_items'][unique_items],
+                        representations['image_masked_items'][unique_items],
+                    )
+                    text_item_cl_loss = self.symmetric_info_nce(
+                        representations['text_full_items'][unique_items],
+                        representations['text_masked_items'][unique_items],
+                    )
+                    contrastive_loss = 0.25 * (
+                        image_user_cl_loss
+                        + text_user_cl_loss
+                        + image_item_cl_loss
+                        + text_item_cl_loss
+                    )
+                else:
+                    user_cl_loss = self.symmetric_info_nce(
+                        representations['full_users'][unique_users],
+                        representations['masked_users'][unique_users],
+                    )
+                    item_cl_loss = self.symmetric_info_nce(
+                        representations['full_items'][unique_items],
+                        representations['masked_items'][unique_items],
+                    )
+                    contrastive_loss = 0.5 * (
+                        user_cl_loss + item_cl_loss
+                    )
             else:
                 user_cl_loss = self.InfoNCE(
                     self.dropoutf(user_embeddings),
@@ -1281,7 +1314,9 @@ class DUAL_MODALITY(GeneralRecommender):
                     self.dropoutf(positive_embeddings),
                     self.cl_temperature,
                 )
-            contrastive_loss = 0.5 * (user_cl_loss + item_cl_loss)
+                contrastive_loss = 0.5 * (
+                    user_cl_loss + item_cl_loss
+                )
         else:
             contrastive_loss = ranking_loss.new_zeros(())
 
