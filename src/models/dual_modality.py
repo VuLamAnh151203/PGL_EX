@@ -127,6 +127,12 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mask_graph_mode = str(
             _config_value(config, 'mask_graph_mode', 'hard')
         ).lower()
+        self.mask_generation_mode = str(
+            _config_value(config, 'mask_generation_mode', 'edge_logits')
+        ).lower()
+        self.mask_hidden_dim = int(
+            _config_value(config, 'mask_hidden_dim', self.embedding_dim)
+        )
         self.mask_sharing_mode = str(
             _config_value(config, 'mask_sharing_mode', 'separate')
         ).lower()
@@ -179,9 +185,27 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('dropout must be in [0, 1).')
         if self.mask_graph_mode not in {'soft', 'hard'}:
             raise ValueError("mask_graph_mode must be 'soft' or 'hard'.")
+        if self.mask_generation_mode not in {
+            'edge_logits', 'feature_network'
+        }:
+            raise ValueError(
+                "mask_generation_mode must be 'edge_logits' or "
+                "'feature_network'."
+            )
+        if self.mask_hidden_dim <= 0:
+            raise ValueError('mask_hidden_dim must be positive.')
         if self.mask_sharing_mode not in {'shared', 'separate'}:
             raise ValueError(
                 "mask_sharing_mode must be 'shared' or 'separate'."
+            )
+        if (
+            self.mask_generation_mode == 'feature_network'
+            and self.mask_sharing_mode != 'separate'
+        ):
+            raise ValueError(
+                "mask_generation_mode='feature_network' requires "
+                "mask_sharing_mode='separate' because image and text "
+                "use different mask networks."
             )
         if self.fusion_gate_mode not in {'shared', 'separate'}:
             raise ValueError(
@@ -253,20 +277,29 @@ class DUAL_MODALITY(GeneralRecommender):
         initial_logit = math.log(
             self.mask_keep_ratio / (1.0 - self.mask_keep_ratio)
         )
-        mask_template = torch.full(
-            (self.num_interactions,),
-            initial_logit,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        if self.mask_sharing_mode == 'shared':
-            self.shared_mask_logits = nn.Parameter(mask_template)
+        if self.mask_generation_mode == 'feature_network':
+            self.register_parameter('shared_mask_logits', None)
             self.register_parameter('image_mask_logits', None)
             self.register_parameter('text_mask_logits', None)
+            self.image_mask_net = self._build_mask_network(initial_logit)
+            self.text_mask_net = self._build_mask_network(initial_logit)
         else:
-            self.register_parameter('shared_mask_logits', None)
-            self.image_mask_logits = nn.Parameter(mask_template.clone())
-            self.text_mask_logits = nn.Parameter(mask_template.clone())
+            self.image_mask_net = None
+            self.text_mask_net = None
+            mask_template = torch.full(
+                (self.num_interactions,),
+                initial_logit,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if self.mask_sharing_mode == 'shared':
+                self.shared_mask_logits = nn.Parameter(mask_template)
+                self.register_parameter('image_mask_logits', None)
+                self.register_parameter('text_mask_logits', None)
+            else:
+                self.register_parameter('shared_mask_logits', None)
+                self.image_mask_logits = nn.Parameter(mask_template.clone())
+                self.text_mask_logits = nn.Parameter(mask_template.clone())
 
         for modality in ('shared', 'image', 'text'):
             for split in ('train', 'eval'):
@@ -424,6 +457,62 @@ class DUAL_MODALITY(GeneralRecommender):
         x = F.normalize(x, dim=-1)
         return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
 
+    def _build_mask_network(self, initial_logit):
+        mask_network = nn.Sequential(
+            nn.Linear(3 * self.embedding_dim, self.mask_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.mask_hidden_dim, 1),
+        )
+        for layer in mask_network:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        nn.init.constant_(mask_network[-1].bias, initial_logit)
+        return mask_network
+
+    def _project_item_features(self):
+        image_features = F.normalize(
+            self.image_trs(self.image_embedding.weight),
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+        text_features = F.normalize(
+            self.text_trs(self.text_embedding.weight),
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+        return image_features, text_features
+
+    def _feature_network_mask_logits(self, modality, item_features):
+        if modality == 'image':
+            user_table = self.masked_user_image.weight
+            mask_network = self.image_mask_net
+        elif modality == 'text':
+            user_table = self.masked_user_text.weight
+            mask_network = self.text_mask_net
+        else:
+            raise ValueError("modality must be 'image' or 'text'.")
+
+        edge_users, edge_items = self.edge_indices
+        user_features = F.normalize(
+            user_table.index_select(0, edge_users),
+            p=2,
+            dim=-1,
+            eps=1e-12,
+        )
+        edge_item_features = item_features.index_select(0, edge_items)
+        mask_input = torch.cat(
+            (
+                user_features,
+                edge_item_features,
+                user_features * edge_item_features,
+            ),
+            dim=1,
+        )
+        return mask_network(mask_input).squeeze(-1)
+
     def save(self):
         pass
 
@@ -456,31 +545,39 @@ class DUAL_MODALITY(GeneralRecommender):
 
     def pre_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
-            if self.mask_sharing_mode == 'shared':
-                self.shared_hard_train_indices = self._sample_hard_indices(
-                    self.shared_mask_logits
-                )
-            else:
-                self.image_hard_train_indices = self._sample_hard_indices(
-                    self.image_mask_logits
-                )
-                self.text_hard_train_indices = self._sample_hard_indices(
-                    self.text_mask_logits
-                )
+            with torch.no_grad():
+                if self.mask_generation_mode == 'feature_network':
+                    image_features, text_features = (
+                        self._project_item_features()
+                    )
+                else:
+                    image_features, text_features = None, None
+                for modality, mask_logits in self._unique_mask_logits(
+                    image_features, text_features
+                ):
+                    setattr(
+                        self,
+                        '{}_hard_train_indices'.format(modality),
+                        self._sample_hard_indices(mask_logits),
+                    )
 
     def post_epoch_processing(self):
         if self.mask_graph_mode == 'hard':
-            if self.mask_sharing_mode == 'shared':
-                self.shared_hard_eval_indices = self._select_hard_indices(
-                    self.shared_mask_logits
-                )
-            else:
-                self.image_hard_eval_indices = self._select_hard_indices(
-                    self.image_mask_logits
-                )
-                self.text_hard_eval_indices = self._select_hard_indices(
-                    self.text_mask_logits
-                )
+            with torch.no_grad():
+                if self.mask_generation_mode == 'feature_network':
+                    image_features, text_features = (
+                        self._project_item_features()
+                    )
+                else:
+                    image_features, text_features = None, None
+                for modality, mask_logits in self._unique_mask_logits(
+                    image_features, text_features
+                ):
+                    setattr(
+                        self,
+                        '{}_hard_eval_indices'.format(modality),
+                        self._select_hard_indices(mask_logits),
+                    )
 
     def _normalize_adj_m(self, indices, adj_size, edge_weights=None):
         if edge_weights is None:
@@ -517,7 +614,15 @@ class DUAL_MODALITY(GeneralRecommender):
         )
         return edges, values
 
-    def _get_mask_logits(self, modality):
+    def _get_mask_logits(self, modality, item_features=None):
+        if self.mask_generation_mode == 'feature_network':
+            if item_features is None:
+                raise ValueError(
+                    'item_features are required for feature-network masks.'
+                )
+            return self._feature_network_mask_logits(
+                modality, item_features
+            )
         if self.mask_sharing_mode == 'shared':
             return self.shared_mask_logits
         if modality == 'image':
@@ -526,13 +631,44 @@ class DUAL_MODALITY(GeneralRecommender):
             return self.text_mask_logits
         raise ValueError("modality must be 'image' or 'text'.")
 
-    def _unique_mask_logits(self):
+    def _unique_mask_logits(
+        self, image_features=None, text_features=None
+    ):
+        if self.mask_generation_mode == 'feature_network':
+            return (
+                (
+                    'image',
+                    self._get_mask_logits('image', image_features),
+                ),
+                (
+                    'text',
+                    self._get_mask_logits('text', text_features),
+                ),
+            )
         if self.mask_sharing_mode == 'shared':
             return (('shared', self.shared_mask_logits),)
         return (
             ('image', self.image_mask_logits),
             ('text', self.text_mask_logits),
         )
+
+    def _latest_unique_mask_logits(self):
+        if self.mask_generation_mode == 'feature_network':
+            if self.latest_representations is None:
+                raise RuntimeError(
+                    'forward() must run before reading feature-network masks.'
+                )
+            return (
+                (
+                    'image',
+                    self.latest_representations['image_mask_logits'],
+                ),
+                (
+                    'text',
+                    self.latest_representations['text_mask_logits'],
+                ),
+            )
+        return self._unique_mask_logits()
 
     def _current_hard_indices(self, modality, mask_logits):
         if self.mask_sharing_mode == 'shared':
@@ -771,18 +907,7 @@ class DUAL_MODALITY(GeneralRecommender):
         )
 
     def forward(self, adj):
-        image_feats = F.normalize(
-            self.image_trs(self.image_embedding.weight),
-            p=2,
-            dim=-1,
-            eps=1e-12,
-        )
-        text_feats = F.normalize(
-            self.text_trs(self.text_embedding.weight),
-            p=2,
-            dim=-1,
-            eps=1e-12,
-        )
+        image_feats, text_feats = self._project_item_features()
 
         image_full_initial = torch.cat(
             (self.user_image.weight, image_feats), dim=0
@@ -797,11 +922,20 @@ class DUAL_MODALITY(GeneralRecommender):
             (self.masked_user_text.weight, text_feats), dim=0
         )
 
+        unique_mask_logits = dict(
+            self._unique_mask_logits(image_feats, text_feats)
+        )
+        if self.mask_sharing_mode == 'shared':
+            image_mask_logits = unique_mask_logits['shared']
+            text_mask_logits = unique_mask_logits['shared']
+        else:
+            image_mask_logits = unique_mask_logits['image']
+            text_mask_logits = unique_mask_logits['text']
         image_masked_adj, image_mask = self._masked_ui_adjacency(
-            'image', self._get_mask_logits('image')
+            'image', image_mask_logits
         )
         text_masked_adj, text_mask = self._masked_ui_adjacency(
-            'text', self._get_mask_logits('text')
+            'text', text_mask_logits
         )
         full_initial = torch.cat(
             (image_full_initial, text_full_initial), dim=1
@@ -947,6 +1081,8 @@ class DUAL_MODALITY(GeneralRecommender):
             'text_item_gate': text_item_gate,
             'shared_user_gate': shared_user_gate,
             'shared_item_gate': shared_item_gate,
+            'image_mask_logits': image_mask_logits,
+            'text_mask_logits': text_mask_logits,
             'image_mask': image_mask,
             'text_mask': text_mask,
         }
@@ -1044,7 +1180,7 @@ class DUAL_MODALITY(GeneralRecommender):
 
         mask_losses = []
         mask_means = []
-        for _, mask_logits in self._unique_mask_logits():
+        for _, mask_logits in self._latest_unique_mask_logits():
             probabilities = torch.sigmoid(mask_logits)
             mask_mean = probabilities.mean()
             budget_loss = (mask_mean - self.mask_keep_ratio).pow(2)
@@ -1153,7 +1289,7 @@ class DUAL_MODALITY(GeneralRecommender):
         representations = self.latest_representations
 
         masks = {}
-        for modality, logits in self._unique_mask_logits():
+        for modality, logits in self._latest_unique_mask_logits():
             selected_indices = self._select_hard_indices(logits)
             selected = torch.zeros_like(logits, dtype=torch.bool)
             selected[selected_indices] = True
@@ -1168,6 +1304,8 @@ class DUAL_MODALITY(GeneralRecommender):
                 'model': self.__class__.__name__,
                 'ui_branch_mode': 'four_branch_dual_modality',
                 'mask_graph_mode': self.mask_graph_mode,
+                'mask_generation_mode': self.mask_generation_mode,
+                'mask_hidden_dim': self.mask_hidden_dim,
                 'mask_sharing_mode': self.mask_sharing_mode,
                 'fusion_gate_mode': self.fusion_gate_mode,
                 'mask_degree_mode': self.mask_degree_mode,
@@ -1210,7 +1348,10 @@ class DUAL_MODALITY(GeneralRecommender):
                 key: value.detach().cpu()
                 for key, value in representations.items()
                 if torch.is_tensor(value) and key not in {
-                    'image_mask', 'text_mask'
+                    'image_mask',
+                    'text_mask',
+                    'image_mask_logits',
+                    'text_mask_logits',
                 }
             },
         }

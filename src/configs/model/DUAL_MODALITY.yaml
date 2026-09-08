@@ -14,7 +14,12 @@ mm_graph_mode: separate
 # Used only by mixed mode to build alpha*A_image + (1-alpha)*A_text.
 mm_image_weight: 0.1
 
-# This experiment keeps independent image/text edge masks.
+# feature_network: logits come from f_m([user || item || user*item]).
+# edge_logits: learn one free logit per observed U-I edge.
+mask_generation_mode: feature_network
+mask_hidden_dim: 64
+
+# Feature-network mode uses independent image/text mask networks.
 mask_sharing_mode: separate
 
 # shared: concatenate modalities first, then use one full-vs-masked gate.

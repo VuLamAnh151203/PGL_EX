@@ -92,6 +92,8 @@ class DualModalityTest(unittest.TestCase):
         aux_bpr_mode='none',
         aux_bpr_weight=0.0,
         mm_graph_mode='mixed',
+        mask_generation_mode='edge_logits',
+        mask_hidden_dim=4,
     ):
         return NullableConfig(
             {
@@ -114,6 +116,8 @@ class DualModalityTest(unittest.TestCase):
                 'mm_image_weight': 0.25,
                 'mm_graph_mode': mm_graph_mode,
                 'mask_sharing_mode': mask_sharing_mode,
+                'mask_generation_mode': mask_generation_mode,
+                'mask_hidden_dim': mask_hidden_dim,
                 'fusion_gate_mode': fusion_gate_mode,
                 'mask_graph_mode': mask_graph_mode,
                 'mask_degree_mode': 'full',
@@ -141,6 +145,8 @@ class DualModalityTest(unittest.TestCase):
         aux_bpr_mode='none',
         aux_bpr_weight=0.0,
         mm_graph_mode='mixed',
+        mask_generation_mode='edge_logits',
+        mask_hidden_dim=4,
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -153,6 +159,8 @@ class DualModalityTest(unittest.TestCase):
                 aux_bpr_mode,
                 aux_bpr_weight,
                 mm_graph_mode,
+                mask_generation_mode,
+                mask_hidden_dim,
             ),
             FakeTrainData(),
         )
@@ -369,6 +377,133 @@ class DualModalityTest(unittest.TestCase):
                 image_adj._nnz(), 2 * model.hard_keep_count
             )
             self.assertEqual(text_adj._nnz(), 2 * model.hard_keep_count)
+
+    def test_feature_network_masks_use_pre_propagation_user_item_inputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='feature_network',
+                mask_hidden_dim=3,
+            )
+            self.assertIsNone(model.shared_mask_logits)
+            self.assertIsNone(model.image_mask_logits)
+            self.assertIsNone(model.text_mask_logits)
+            self.assertIsNot(model.image_mask_net, model.text_mask_net)
+            self.assertEqual(
+                tuple(model.image_mask_net[0].weight.shape), (3, 6)
+            )
+
+            model.forward(model.norm_adj)
+            representations = model.latest_representations
+            image_features, text_features = model._project_item_features()
+            edge_users, edge_items = model.edge_indices
+
+            def expected_logits(user_table, item_features, mask_net):
+                edge_user_features = torch.nn.functional.normalize(
+                    user_table.weight.index_select(0, edge_users), dim=-1
+                )
+                edge_item_features = item_features.index_select(
+                    0, edge_items
+                )
+                inputs = torch.cat(
+                    (
+                        edge_user_features,
+                        edge_item_features,
+                        edge_user_features * edge_item_features,
+                    ),
+                    dim=1,
+                )
+                return mask_net(inputs).squeeze(-1)
+
+            expected_image_logits = expected_logits(
+                model.masked_user_image,
+                image_features,
+                model.image_mask_net,
+            )
+            expected_text_logits = expected_logits(
+                model.masked_user_text,
+                text_features,
+                model.text_mask_net,
+            )
+            torch.testing.assert_close(
+                representations['image_mask_logits'],
+                expected_image_logits,
+            )
+            torch.testing.assert_close(
+                representations['text_mask_logits'],
+                expected_text_logits,
+            )
+            torch.testing.assert_close(
+                representations['image_mask'],
+                torch.sigmoid(expected_image_logits),
+            )
+            torch.testing.assert_close(
+                representations['text_mask'],
+                torch.sigmoid(expected_text_logits),
+            )
+
+            loss = model.calculate_loss(self.interaction())
+            loss.backward()
+            for parameter in (
+                model.image_mask_net[0].weight,
+                model.image_mask_net[-1].weight,
+                model.text_mask_net[0].weight,
+                model.text_mask_net[-1].weight,
+            ):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['mask_generation_mode'],
+                'feature_network',
+            )
+            self.assertEqual(artifacts['metadata']['mask_hidden_dim'], 3)
+            self.assertEqual(set(artifacts['masks']), {'image', 'text'})
+
+            hard_model = self.make_model(
+                root,
+                mask_graph_mode='hard',
+                mask_generation_mode='feature_network',
+            )
+            hard_model.pre_epoch_processing()
+            self.assertEqual(
+                hard_model.image_hard_train_indices.numel(),
+                hard_model.hard_keep_count,
+            )
+            self.assertEqual(
+                hard_model.text_hard_train_indices.numel(),
+                hard_model.hard_keep_count,
+            )
+            hard_loss = hard_model.calculate_loss(self.interaction())
+            self.assertTrue(torch.isfinite(hard_loss))
+            hard_loss.backward()
+            self.assertTrue(
+                torch.isfinite(
+                    hard_model.image_mask_net[-1].weight.grad
+                ).all()
+            )
+            self.assertTrue(
+                torch.isfinite(
+                    hard_model.text_mask_net[-1].weight.grad
+                ).all()
+            )
+
+            restored = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_generation_mode='feature_network',
+                mask_hidden_dim=3,
+            )
+            restored.load_state_dict(model.state_dict())
+            restored.eval()
+            model.eval()
+            actual_users, actual_items = restored.forward(restored.norm_adj)
+            expected_users, expected_items = model.forward(model.norm_adj)
+            torch.testing.assert_close(actual_users, expected_users)
+            torch.testing.assert_close(actual_items, expected_items)
 
     def test_shared_mask_uses_one_parameter_and_one_edge_selection(self):
         with tempfile.TemporaryDirectory() as root:
