@@ -148,6 +148,9 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mask_sharing_mode = str(
             _config_value(config, 'mask_sharing_mode', 'separate')
         ).lower()
+        self.mask_assignment_mode = str(
+            _config_value(config, 'mask_assignment_mode', 'normal')
+        ).lower()
         self.fusion_gate_mode = str(
             _config_value(config, 'fusion_gate_mode', 'separate')
         ).lower()
@@ -230,6 +233,18 @@ class DUAL_MODALITY(GeneralRecommender):
         if self.mask_sharing_mode not in {'shared', 'separate'}:
             raise ValueError(
                 "mask_sharing_mode must be 'shared' or 'separate'."
+            )
+        if self.mask_assignment_mode not in {'normal', 'swapped'}:
+            raise ValueError(
+                "mask_assignment_mode must be 'normal' or 'swapped'."
+            )
+        if (
+            self.mask_assignment_mode == 'swapped'
+            and self.mask_sharing_mode != 'separate'
+        ):
+            raise ValueError(
+                "mask_assignment_mode='swapped' requires "
+                "mask_sharing_mode='separate'."
             )
         if (
             self.mask_specialization_mode == 'user_js'
@@ -606,7 +621,7 @@ class DUAL_MODALITY(GeneralRecommender):
                     )
                 else:
                     image_features, text_features = None, None
-                for modality, mask_logits in self._unique_mask_logits(
+                for modality, mask_logits in self._assigned_mask_logits(
                     image_features, text_features
                 ):
                     setattr(
@@ -624,7 +639,7 @@ class DUAL_MODALITY(GeneralRecommender):
                     )
                 else:
                     image_features, text_features = None, None
-                for modality, mask_logits in self._unique_mask_logits(
+                for modality, mask_logits in self._assigned_mask_logits(
                     image_features, text_features
                 ):
                     setattr(
@@ -706,6 +721,49 @@ class DUAL_MODALITY(GeneralRecommender):
             ('text', self.text_mask_logits),
         )
 
+    def _assigned_mask_logits(
+        self, image_features=None, text_features=None
+    ):
+        generated_logits = dict(
+            self._unique_mask_logits(image_features, text_features)
+        )
+        if self.mask_sharing_mode == 'shared':
+            return (('shared', generated_logits['shared']),)
+        if self.mask_assignment_mode == 'swapped':
+            return (
+                ('image', generated_logits['text']),
+                ('text', generated_logits['image']),
+            )
+        return (
+            ('image', generated_logits['image']),
+            ('text', generated_logits['text']),
+        )
+
+    def set_mask_assignment_mode(self, mode):
+        """Assign learned masks normally or swap them across modalities."""
+        mode = str(mode).lower()
+        if mode not in {'normal', 'swapped'}:
+            raise ValueError(
+                "mask assignment mode must be 'normal' or 'swapped'."
+            )
+        if mode == 'swapped' and self.mask_sharing_mode != 'separate':
+            raise ValueError(
+                "Swapping masks requires mask_sharing_mode='separate'."
+            )
+        self.mask_assignment_mode = mode
+        for modality in ('shared', 'image', 'text'):
+            for split in ('train', 'eval'):
+                buffer_name = '{}_hard_{}_indices'.format(
+                    modality, split
+                )
+                if hasattr(self, buffer_name):
+                    current = getattr(self, buffer_name)
+                    setattr(
+                        self,
+                        buffer_name,
+                        current.new_empty(0, dtype=torch.long),
+                    )
+
     def _latest_unique_mask_logits(self):
         if self.mask_generation_mode == 'feature_network':
             if self.latest_representations is None:
@@ -722,7 +780,7 @@ class DUAL_MODALITY(GeneralRecommender):
                     self.latest_representations['text_mask_logits'],
                 ),
             )
-        return self._unique_mask_logits()
+        return self._assigned_mask_logits()
 
     def _current_hard_indices(self, modality, mask_logits):
         if self.mask_sharing_mode == 'shared':
@@ -976,15 +1034,15 @@ class DUAL_MODALITY(GeneralRecommender):
             (self.masked_user_text.weight, text_feats), dim=0
         )
 
-        unique_mask_logits = dict(
-            self._unique_mask_logits(image_feats, text_feats)
+        assigned_mask_logits = dict(
+            self._assigned_mask_logits(image_feats, text_feats)
         )
         if self.mask_sharing_mode == 'shared':
-            image_mask_logits = unique_mask_logits['shared']
-            text_mask_logits = unique_mask_logits['shared']
+            image_mask_logits = assigned_mask_logits['shared']
+            text_mask_logits = assigned_mask_logits['shared']
         else:
-            image_mask_logits = unique_mask_logits['image']
-            text_mask_logits = unique_mask_logits['text']
+            image_mask_logits = assigned_mask_logits['image']
+            text_mask_logits = assigned_mask_logits['text']
         image_masked_adj, image_mask = self._masked_ui_adjacency(
             'image', image_mask_logits
         )
@@ -1498,6 +1556,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'mask_generation_mode': self.mask_generation_mode,
                 'mask_hidden_dim': self.mask_hidden_dim,
                 'mask_sharing_mode': self.mask_sharing_mode,
+                'mask_assignment_mode': self.mask_assignment_mode,
                 'fusion_gate_mode': self.fusion_gate_mode,
                 'mask_degree_mode': self.mask_degree_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,

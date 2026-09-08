@@ -19,6 +19,17 @@ from models.dual_modality import DUAL_MODALITY  # noqa: E402
 from mask_analysis.dual_modality_diagnostics import (  # noqa: E402
     summarize_rankings,
 )
+from mask_analysis.dual_modality_mask_swap import (  # noqa: E402
+    compare_rankings,
+    metric_deltas,
+)
+from mask_analysis.dual_modality_mask_analysis import (  # noqa: E402
+    collect_mask_snapshot,
+    controlled_propagation_effects,
+    mask_intervention,
+    per_user_mask_statistics,
+    random_mask_baseline,
+)
 
 
 class NullableConfig(dict):
@@ -1124,6 +1135,187 @@ class DualModalityTest(unittest.TestCase):
                     root,
                     mask_sharing_mode='shared',
                     mask_specialization_mode='user_js',
+                )
+
+    def test_mask_assignment_swaps_feature_network_outputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='hard',
+                mask_sharing_mode='separate',
+                mask_generation_mode='feature_network',
+                mask_hidden_dim=3,
+            )
+            model.eval()
+            normal_users, normal_items = model.forward(model.norm_adj)
+            normal_image_logits = model.latest_representations[
+                'image_mask_logits'
+            ].detach().clone()
+            normal_text_logits = model.latest_representations[
+                'text_mask_logits'
+            ].detach().clone()
+            self.assertGreater(model.image_hard_eval_indices.numel(), 0)
+            self.assertGreater(model.text_hard_eval_indices.numel(), 0)
+
+            model.set_mask_assignment_mode('swapped')
+            self.assertEqual(model.image_hard_eval_indices.numel(), 0)
+            self.assertEqual(model.text_hard_eval_indices.numel(), 0)
+            model.forward(model.norm_adj)
+            torch.testing.assert_close(
+                model.latest_representations['image_mask_logits'],
+                normal_text_logits,
+            )
+            torch.testing.assert_close(
+                model.latest_representations['text_mask_logits'],
+                normal_image_logits,
+            )
+
+            model.set_mask_assignment_mode('normal')
+            restored_users, restored_items = model.forward(model.norm_adj)
+            torch.testing.assert_close(restored_users, normal_users)
+            torch.testing.assert_close(restored_items, normal_items)
+
+    def test_mask_swap_comparison_reports_metric_and_ranking_changes(self):
+        normal = torch.tensor([[1, 2, 3], [3, 2, 1]])
+        swapped = torch.tensor([[1, 3, 2], [3, 2, 1]])
+        comparison = compare_rankings(normal, swapped, [1, 2, 3])
+        self.assertEqual(
+            comparison['Top1']['users_with_changed_order'], 0
+        )
+        self.assertEqual(
+            comparison['Top2']['users_with_changed_order'], 1
+        )
+        self.assertEqual(
+            comparison['Top2']['users_with_changed_item_set'], 1
+        )
+        self.assertEqual(
+            comparison['Top3']['users_with_changed_item_set'], 0
+        )
+        self.assertAlmostEqual(
+            comparison['Top2']['mean_item_overlap_rate'], 0.75
+        )
+        self.assertEqual(
+            metric_deltas(
+                {'recall@10': 0.2, 'ndcg@10': 0.1},
+                {'recall@10': 0.25, 'ndcg@10': 0.08},
+            ),
+            {'recall@10': 0.05, 'ndcg@10': -0.02},
+        )
+
+    def test_mask_analysis_random_baseline_preserves_user_budgets(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='hard',
+                mask_sharing_mode='separate',
+            )
+            with torch.no_grad():
+                model.image_mask_logits.copy_(
+                    torch.linspace(-2.0, 2.0, model.num_interactions)
+                )
+                model.text_mask_logits.copy_(
+                    torch.linspace(2.0, -2.0, model.num_interactions)
+                )
+            snapshot = collect_mask_snapshot(model)
+            statistics = per_user_mask_statistics(
+                snapshot, model.n_users
+            )
+            baselines = random_mask_baseline(
+                snapshot, statistics, repeats=5, seed=123
+            )
+
+            self.assertEqual(snapshot['selection_kind'], 'exact_hard_mask')
+            self.assertEqual(len(baselines), 5)
+            for baseline in baselines:
+                self.assertAlmostEqual(
+                    sum(baseline[group] for group in (
+                        'both', 'image_only', 'text_only', 'neither'
+                    )),
+                    1.0,
+                )
+                self.assertAlmostEqual(
+                    baseline['both_empty_user_rate'],
+                    statistics['both_empty'][
+                        statistics['degree'] > 0
+                    ].mean(),
+                )
+
+    def test_mask_analysis_permutation_stays_within_each_user(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                mask_graph_mode='soft',
+                mask_sharing_mode='separate',
+            )
+            with torch.no_grad():
+                model.image_mask_logits.copy_(
+                    torch.linspace(-2.0, 2.0, model.num_interactions)
+                )
+                model.text_mask_logits.copy_(
+                    torch.linspace(2.0, -2.0, model.num_interactions)
+                )
+            model.eval()
+            model.forward(model.norm_adj)
+            original_image = model.latest_representations[
+                'image_mask_logits'
+            ].detach().clone()
+            original_text = model.latest_representations[
+                'text_mask_logits'
+            ].detach().clone()
+
+            with mask_intervention(model, 'permute_image', seed=7):
+                model.forward(model.norm_adj)
+                permuted_image = model.latest_representations[
+                    'image_mask_logits'
+                ]
+                permuted_text = model.latest_representations[
+                    'text_mask_logits'
+                ]
+                for user in range(model.n_users):
+                    selected = model.edge_indices[0] == user
+                    torch.testing.assert_close(
+                        torch.sort(permuted_image[selected]).values,
+                        torch.sort(original_image[selected]).values,
+                    )
+                torch.testing.assert_close(permuted_text, original_text)
+
+            self.assertEqual(model.mask_assignment_mode, 'normal')
+            model.forward(model.norm_adj)
+            torch.testing.assert_close(
+                model.latest_representations['image_mask_logits'],
+                original_image,
+            )
+
+            effects = controlled_propagation_effects(model)
+            for modality in ('image', 'text'):
+                self.assertIn('constant_mask', effects[modality])
+                for control in ('masked', 'constant_mask'):
+                    for metric in ('cosine_distance', 'norm_ratio'):
+                        values = effects[modality][control][metric]
+                        self.assertEqual(values.shape, (model.n_users,))
+                        self.assertTrue(np.isfinite(values).all())
+
+            with torch.no_grad(), mask_intervention(
+                model, 'full_adjacency'
+            ):
+                image_features, _ = model._project_item_features()
+                initial = torch.cat(
+                    (model.masked_user_image.weight, image_features), dim=0
+                )
+                expected = model._propagate_ui_graph(
+                    model.norm_adj, initial, model.n_ui_layers
+                )[:model.n_users]
+                model.forward(model.norm_adj)
+                torch.testing.assert_close(
+                    model.latest_representations['image_masked_users'],
+                    expected,
+                )
+                torch.testing.assert_close(
+                    model.latest_representations['image_mask'],
+                    torch.ones(model.num_interactions),
                 )
 
     def test_post_training_ranking_summary_reports_rescue_and_harm(self):

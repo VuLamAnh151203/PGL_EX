@@ -21,6 +21,9 @@ mask_hidden_dim: 64
 
 # Feature-network mode uses independent image/text mask networks.
 mask_sharing_mode: separate
+# normal during training; the checkpoint swap-analysis script changes this
+# temporarily to swapped without modifying checkpoint parameters.
+mask_assignment_mode: normal
 
 # shared: concatenate modalities first, then use one full-vs-masked gate.
 # separate: fuse full/masked inside each modality using two gates.
