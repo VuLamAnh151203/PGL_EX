@@ -161,6 +161,56 @@ class DualModalityTest(unittest.TestCase):
     def interaction():
         return torch.tensor([[0, 2], [0, 3], [2, 0]], dtype=torch.long)
 
+    def test_memory_safe_sparse_mm_matches_edge_gradient_reference(self):
+        indices = torch.tensor(
+            [[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long
+        )
+        values = torch.tensor(
+            [0.2, 0.3, 0.4, 0.5], requires_grad=True
+        )
+        embeddings = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+            requires_grad=True,
+        )
+        adjacency = torch.sparse_coo_tensor(
+            indices, values, (3, 3)
+        ).coalesce()
+        output_gradients = torch.tensor(
+            [[0.5, 1.0], [1.5, -0.5], [2.0, 0.25]]
+        )
+
+        with mock.patch.object(
+            DUAL_MODALITY,
+            '_memory_safe_sparse_mm',
+            wraps=DUAL_MODALITY._memory_safe_sparse_mm,
+        ) as memory_safe_mm:
+            output = DUAL_MODALITY._propagate_ui_graph(
+                adjacency, embeddings, 1
+            )
+        self.assertEqual(memory_safe_mm.call_count, 1)
+
+        # _propagate_ui_graph averages X and AX for one layer.
+        propagated_gradients = 0.5 * output_gradients
+        expected_value_gradients = (
+            propagated_gradients.index_select(0, indices[0])
+            * embeddings.detach().index_select(0, indices[1])
+        ).sum(dim=1)
+        expected_embedding_gradients = 0.5 * output_gradients.clone()
+        edge_embedding_gradients = torch.zeros_like(embeddings)
+        edge_embedding_gradients.index_add_(
+            0,
+            indices[1],
+            values.detach().unsqueeze(1)
+            * output_gradients.index_select(0, indices[0]),
+        )
+        expected_embedding_gradients += 0.5 * edge_embedding_gradients
+
+        torch.sum(output * output_gradients).backward()
+        torch.testing.assert_close(values.grad, expected_value_gradients)
+        torch.testing.assert_close(
+            embeddings.grad, expected_embedding_gradients
+        )
+
     def test_four_branches_use_pgl_layer_mean_and_parallel_ii(self):
         with tempfile.TemporaryDirectory() as root:
             self.write_features(root)

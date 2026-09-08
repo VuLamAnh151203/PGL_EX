@@ -28,6 +28,54 @@ def _config_value(config, key, default):
     return default if value is None else value
 
 
+class _ObservedEdgeSparseMM(torch.autograd.Function):
+    """Sparse MM whose adjacency gradient is evaluated only on COO edges."""
+
+    @staticmethod
+    def forward(ctx, indices, values, size, embeddings):
+        adjacency = torch.sparse_coo_tensor(
+            indices,
+            values,
+            size,
+            dtype=values.dtype,
+            device=values.device,
+        ).coalesce()
+        ctx.adjacency_size = tuple(size)
+        ctx.save_for_backward(
+            adjacency.indices(), adjacency.values(), embeddings
+        )
+        return torch.sparse.mm(adjacency, embeddings)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        indices, values, embeddings = ctx.saved_tensors
+        rows, columns = indices
+
+        grad_values = None
+        if ctx.needs_input_grad[1]:
+            output_gradients = grad_output.index_select(0, rows)
+            source_embeddings = embeddings.index_select(0, columns)
+            grad_values = (
+                output_gradients * source_embeddings
+            ).sum(dim=1)
+
+        grad_embeddings = None
+        if ctx.needs_input_grad[3]:
+            transpose_indices = torch.stack((columns, rows), dim=0)
+            transpose_adjacency = torch.sparse_coo_tensor(
+                transpose_indices,
+                values,
+                (ctx.adjacency_size[1], ctx.adjacency_size[0]),
+                dtype=values.dtype,
+                device=values.device,
+            ).coalesce()
+            grad_embeddings = torch.sparse.mm(
+                transpose_adjacency, grad_output
+            )
+
+        return None, grad_values, None, grad_embeddings
+
+
 class DUAL_MODALITY(GeneralRecommender):
     """PGL with full/masked U-I branches for image and text separately."""
 
@@ -560,13 +608,30 @@ class DUAL_MODALITY(GeneralRecommender):
         return adjacency, probabilities
 
     @staticmethod
+    def _memory_safe_sparse_mm(adjacency, embeddings):
+        adjacency = adjacency.coalesce()
+        return _ObservedEdgeSparseMM.apply(
+            adjacency.indices(),
+            adjacency.values(),
+            tuple(adjacency.shape),
+            embeddings,
+        )
+
+    @staticmethod
     def _propagate_ui_graph(adjacency, initial_embeddings, n_layers):
+        adjacency = adjacency.coalesce()
+        differentiable_adjacency = adjacency.requires_grad
         all_embeddings = [initial_embeddings]
         current_embeddings = initial_embeddings
         for _ in range(n_layers):
-            current_embeddings = torch.sparse.mm(
-                adjacency, current_embeddings
-            )
+            if differentiable_adjacency:
+                current_embeddings = DUAL_MODALITY._memory_safe_sparse_mm(
+                    adjacency, current_embeddings
+                )
+            else:
+                current_embeddings = torch.sparse.mm(
+                    adjacency, current_embeddings
+                )
             all_embeddings.append(current_embeddings)
         return torch.stack(all_embeddings, dim=1).mean(dim=1)
 
