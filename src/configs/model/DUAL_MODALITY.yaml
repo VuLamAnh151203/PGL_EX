@@ -8,6 +8,10 @@ learning_rate: 0.001
 n_ui_layers: 2
 n_mm_layers: 1
 knn_k: 10
+# separate: propagate image with A_image and text with A_text.
+# mixed: propagate both feature tables with the weighted mixed graph.
+mm_graph_mode: separate
+# Used only by mixed mode to build alpha*A_image + (1-alpha)*A_text.
 mm_image_weight: 0.1
 
 # This experiment keeps independent image/text edge masks.

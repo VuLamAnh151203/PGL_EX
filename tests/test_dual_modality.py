@@ -91,6 +91,7 @@ class DualModalityTest(unittest.TestCase):
         cl_mode='pgl_dropout',
         aux_bpr_mode='none',
         aux_bpr_weight=0.0,
+        mm_graph_mode='mixed',
     ):
         return NullableConfig(
             {
@@ -111,6 +112,7 @@ class DualModalityTest(unittest.TestCase):
                 'n_mm_layers': 1,
                 'n_ui_layers': 2,
                 'mm_image_weight': 0.25,
+                'mm_graph_mode': mm_graph_mode,
                 'mask_sharing_mode': mask_sharing_mode,
                 'fusion_gate_mode': fusion_gate_mode,
                 'mask_graph_mode': mask_graph_mode,
@@ -138,6 +140,7 @@ class DualModalityTest(unittest.TestCase):
         cl_mode='pgl_dropout',
         aux_bpr_mode='none',
         aux_bpr_weight=0.0,
+        mm_graph_mode='mixed',
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -149,6 +152,7 @@ class DualModalityTest(unittest.TestCase):
                 cl_mode,
                 aux_bpr_mode,
                 aux_bpr_weight,
+                mm_graph_mode,
             ),
             FakeTrainData(),
         )
@@ -196,6 +200,56 @@ class DualModalityTest(unittest.TestCase):
             torch.testing.assert_close(
                 items,
                 representations['ui_items'] + representations['mm_items'],
+            )
+
+    def test_separate_mm_graphs_propagate_each_modality_independently(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(root, mm_graph_mode='separate')
+            model.eval()
+            _, items = model.forward(model.norm_adj)
+            representations = model.latest_representations
+
+            image_features = torch.nn.functional.normalize(
+                model.image_trs(model.image_embedding.weight), dim=-1
+            )
+            text_features = torch.nn.functional.normalize(
+                model.text_trs(model.text_embedding.weight), dim=-1
+            )
+            expected_image = image_features
+            expected_text = text_features
+            for _ in range(model.n_layers):
+                expected_image = torch.sparse.mm(
+                    model.image_mm_adj, expected_image
+                )
+                expected_text = torch.sparse.mm(
+                    model.text_mm_adj, expected_text
+                )
+
+            torch.testing.assert_close(
+                representations['image_mm_items'], expected_image
+            )
+            torch.testing.assert_close(
+                representations['text_mm_items'], expected_text
+            )
+            torch.testing.assert_close(
+                representations['mm_items'],
+                torch.cat((expected_image, expected_text), dim=1),
+            )
+            torch.testing.assert_close(
+                items,
+                torch.cat(
+                    (
+                        representations['image_items'],
+                        representations['text_items'],
+                    ),
+                    dim=1,
+                ),
+            )
+            self.assertIn('_separate_', model.mm_cache_file)
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['mm_graph_mode'], 'separate'
             )
 
     def test_image_and_text_masks_are_independent(self):
@@ -445,7 +499,7 @@ class DualModalityTest(unittest.TestCase):
                 cl_mode='full_masked_concat',
             )
             interaction = self.interaction()
-            original_info_nce = model.InfoNCE
+            original_info_nce = model.symmetric_info_nce
             with mock.patch.object(
                 model.dropoutf,
                 'forward',
@@ -453,7 +507,7 @@ class DualModalityTest(unittest.TestCase):
                     'Branch-view CL must not create dropout views.'
                 ),
             ), mock.patch.object(
-                model, 'InfoNCE', wraps=original_info_nce
+                model, 'symmetric_info_nce', wraps=original_info_nce
             ) as info_nce:
                 loss = model.calculate_loss(interaction)
 
@@ -462,21 +516,23 @@ class DualModalityTest(unittest.TestCase):
             representations = model.latest_representations
             user_call = info_nce.call_args_list[0].args
             item_call = info_nce.call_args_list[1].args
+            unique_users = torch.unique(interaction[0])
+            unique_items = torch.unique(interaction[1])
             torch.testing.assert_close(
                 user_call[0],
-                representations['full_users'][interaction[0]],
+                representations['full_users'][unique_users],
             )
             torch.testing.assert_close(
                 user_call[1],
-                representations['masked_users'][interaction[0]],
+                representations['masked_users'][unique_users],
             )
             torch.testing.assert_close(
                 item_call[0],
-                representations['full_items'][interaction[1]],
+                representations['full_items'][unique_items],
             )
             torch.testing.assert_close(
                 item_call[1],
-                representations['masked_items'][interaction[1]],
+                representations['masked_items'][unique_items],
             )
             self.assertEqual(user_call[0].shape[1], 4)
             self.assertEqual(item_call[0].shape[1], 4)

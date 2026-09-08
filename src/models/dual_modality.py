@@ -31,7 +31,7 @@ def _config_value(config, key, default):
 class DUAL_MODALITY(GeneralRecommender):
     """PGL with full/masked U-I branches for image and text separately."""
 
-    MM_CACHE_VERSION = 1
+    MM_CACHE_VERSION = 2
 
     def __init__(self, config, dataset):
         super(DUAL_MODALITY, self).__init__(config, dataset)
@@ -47,6 +47,9 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mm_image_weight = float(
             _config_value(config, 'mm_image_weight', 0.1)
         )
+        self.mm_graph_mode = str(
+            _config_value(config, 'mm_graph_mode', 'mixed')
+        ).lower()
         self.cl_weight = float(
             _config_value(
                 config,
@@ -103,6 +106,10 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('Propagation layer counts must be non-negative.')
         if not 0.0 <= self.mm_image_weight <= 1.0:
             raise ValueError('mm_image_weight must be in [0, 1].')
+        if self.mm_graph_mode not in {'mixed', 'separate'}:
+            raise ValueError(
+                "mm_graph_mode must be 'mixed' or 'separate'."
+            )
         if not 0.0 < self.mask_keep_ratio < 1.0:
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
         if self.mask_weight < 0.0 or self.mask_binary_weight < 0.0:
@@ -273,8 +280,12 @@ class DUAL_MODALITY(GeneralRecommender):
                 nn.init.xavier_uniform_(fusion_gate.weight)
                 nn.init.zeros_(fusion_gate.bias)
 
-        mm_adj = self._build_or_load_mm_graph(config)
+        mm_adj, image_mm_adj, text_mm_adj = (
+            self._build_or_load_mm_graph(config)
+        )
         self.register_buffer('mm_adj', mm_adj.coalesce())
+        self.register_buffer('image_mm_adj', image_mm_adj.coalesce())
+        self.register_buffer('text_mm_adj', text_mm_adj.coalesce())
         self.dropoutf = nn.Dropout(self.cl_dropout)
         self.latest_loss_components = {}
         self.latest_representations = None
@@ -589,6 +600,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 masked_embeddings,
                 self.shared_fusion_gate,
             )
+            #???
             image_gate, text_gate = torch.split(
                 shared_gate,
                 [self.embedding_dim, self.embedding_dim],
@@ -615,6 +627,7 @@ class DUAL_MODALITY(GeneralRecommender):
             'num_items': self.n_items,
             'knn_k': self.knn_k,
             'mm_image_weight': self.mm_image_weight,
+            'mm_graph_mode': self.mm_graph_mode,
             'vision_feature_file': str(config['vision_feature_file']),
             'text_feature_file': str(config['text_feature_file']),
             'vision_shape': list(self.v_feat.shape),
@@ -639,22 +652,35 @@ class DUAL_MODALITY(GeneralRecommender):
             os.path.join(str(config['data_path']), str(config['dataset']))
         )
         weight_label = format(self.mm_image_weight, '.8g').replace('.', 'p')
-        cache_name = 'dual_modality_mm_v{}_k{}_w{}.pt'.format(
-            self.MM_CACHE_VERSION, self.knn_k, weight_label
+        cache_name = 'dual_modality_mm_v{}_{}_k{}_w{}.pt'.format(
+            self.MM_CACHE_VERSION,
+            self.mm_graph_mode,
+            self.knn_k,
+            weight_label,
         )
         self.mm_cache_file = os.path.join(dataset_path, cache_name)
         expected_metadata = self._mm_cache_metadata(config)
 
         if os.path.exists(self.mm_cache_file):
             payload = self._load_cache(self.mm_cache_file, self.device)
+            adjacency_keys = (
+                'adjacency', 'image_adjacency', 'text_adjacency'
+            )
+            valid_adjacencies = all(
+                torch.is_tensor(payload.get(key))
+                and tuple(payload[key].shape)
+                == (self.n_items, self.n_items)
+                for key in adjacency_keys
+            ) if isinstance(payload, dict) else False
             if (
                 isinstance(payload, dict)
                 and payload.get('metadata') == expected_metadata
-                and torch.is_tensor(payload.get('adjacency'))
-                and tuple(payload['adjacency'].shape)
-                == (self.n_items, self.n_items)
+                and valid_adjacencies
             ):
-                return payload['adjacency'].to(self.device).coalesce()
+                return tuple(
+                    payload[key].to(self.device).coalesce()
+                    for key in adjacency_keys
+                )
 
         with torch.no_grad():
             _, image_adj = self.get_knn_adj_mat(self.v_feat)
@@ -668,10 +694,16 @@ class DUAL_MODALITY(GeneralRecommender):
             {
                 'metadata': expected_metadata,
                 'adjacency': mm_adj.detach().cpu(),
+                'image_adjacency': image_adj.detach().cpu(),
+                'text_adjacency': text_adj.detach().cpu(),
             },
             self.mm_cache_file,
         )
-        return mm_adj.to(self.device).coalesce()
+        return (
+            mm_adj.to(self.device).coalesce(),
+            image_adj.to(self.device).coalesce(),
+            text_adj.to(self.device).coalesce(),
+        )
 
     def forward(self, adj):
         image_feats = F.normalize(
@@ -779,17 +811,31 @@ class DUAL_MODALITY(GeneralRecommender):
             (image_masked_items, text_masked_items), dim=1
         )
 
-        item_embeddings = torch.cat((image_feats, text_feats), dim=1)
-        mm_item_embeddings = item_embeddings
-        for _ in range(self.n_layers):
-            mm_item_embeddings = torch.sparse.mm(
-                self.mm_adj, mm_item_embeddings
+        if self.mm_graph_mode == 'separate':
+            image_mm_item_embeddings = image_feats
+            text_mm_item_embeddings = text_feats
+            for _ in range(self.n_layers):
+                image_mm_item_embeddings = torch.sparse.mm(
+                    self.image_mm_adj, image_mm_item_embeddings
+                )
+                text_mm_item_embeddings = torch.sparse.mm(
+                    self.text_mm_adj, text_mm_item_embeddings
+                )
+            mm_item_embeddings = torch.cat(
+                (image_mm_item_embeddings, text_mm_item_embeddings), dim=1
             )
-        image_mm_item_embeddings, text_mm_item_embeddings = torch.split(
-            mm_item_embeddings,
-            [self.embedding_dim, self.embedding_dim],
-            dim=1,
-        )
+        else:
+            item_embeddings = torch.cat((image_feats, text_feats), dim=1)
+            mm_item_embeddings = item_embeddings
+            for _ in range(self.n_layers):
+                mm_item_embeddings = torch.sparse.mm(
+                    self.mm_adj, mm_item_embeddings
+                )
+            image_mm_item_embeddings, text_mm_item_embeddings = torch.split(
+                mm_item_embeddings,
+                [self.embedding_dim, self.embedding_dim],
+                dim=1,
+            )
         image_item_embeddings = (
             image_ui_item_embeddings + image_mm_item_embeddings
         )
@@ -1058,6 +1104,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'mask_keep_ratio': self.mask_keep_ratio,
                 'n_ui_layers': self.n_ui_layers,
                 'n_mm_layers': self.n_layers,
+                'mm_graph_mode': self.mm_graph_mode,
                 'mm_image_weight': self.mm_image_weight,
                 'cl_weight': self.cl_weight,
                 'cl_mode': self.cl_mode,
