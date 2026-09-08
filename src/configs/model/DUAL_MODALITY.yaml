@@ -34,6 +34,14 @@ hard_mask_temperature: 1.0
 mask_weight: 0.1
 mask_binary_weight: 0.1
 
+# user_js: enforce a minimum JS divergence between image/text edge-choice
+# distributions inside each user history (users with at least two edges only).
+# none or a zero weight disables the specialization loss.
+mask_specialization_mode: user_js
+mask_specialization_weight: 0.1
+mask_specialization_margin: 0.1
+mask_specialization_eps: 1.0e-8
+
 # full_masked_concat: CL between concat(image, text) full/masked views.
 # pgl_dropout: original PGL dropout-view CL on the final embeddings.
 # cl_weight: 0 disables InfoNCE completely in either mode.

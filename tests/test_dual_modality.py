@@ -8,6 +8,7 @@ from unittest import mock
 import numpy as np
 import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 
 
 SRC_DIR = Path(__file__).resolve().parents[1] / 'src'
@@ -94,6 +95,10 @@ class DualModalityTest(unittest.TestCase):
         mm_graph_mode='mixed',
         mask_generation_mode='edge_logits',
         mask_hidden_dim=4,
+        mask_specialization_mode='none',
+        mask_specialization_weight=0.0,
+        mask_specialization_margin=0.1,
+        mask_specialization_eps=1e-8,
     ):
         return NullableConfig(
             {
@@ -118,6 +123,10 @@ class DualModalityTest(unittest.TestCase):
                 'mask_sharing_mode': mask_sharing_mode,
                 'mask_generation_mode': mask_generation_mode,
                 'mask_hidden_dim': mask_hidden_dim,
+                'mask_specialization_mode': mask_specialization_mode,
+                'mask_specialization_weight': mask_specialization_weight,
+                'mask_specialization_margin': mask_specialization_margin,
+                'mask_specialization_eps': mask_specialization_eps,
                 'fusion_gate_mode': fusion_gate_mode,
                 'mask_graph_mode': mask_graph_mode,
                 'mask_degree_mode': 'full',
@@ -147,6 +156,10 @@ class DualModalityTest(unittest.TestCase):
         mm_graph_mode='mixed',
         mask_generation_mode='edge_logits',
         mask_hidden_dim=4,
+        mask_specialization_mode='none',
+        mask_specialization_weight=0.0,
+        mask_specialization_margin=0.1,
+        mask_specialization_eps=1e-8,
     ):
         return DUAL_MODALITY(
             self.make_config(
@@ -161,6 +174,10 @@ class DualModalityTest(unittest.TestCase):
                 mm_graph_mode,
                 mask_generation_mode,
                 mask_hidden_dim,
+                mask_specialization_mode,
+                mask_specialization_weight,
+                mask_specialization_margin,
+                mask_specialization_eps,
             ),
             FakeTrainData(),
         )
@@ -904,6 +921,137 @@ class DualModalityTest(unittest.TestCase):
             self.assertEqual(
                 artifacts['metadata']['aux_bpr_mode'], 'masked_branch'
             )
+
+    def test_user_js_mask_specialization_loss_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            model = self.make_model(
+                root,
+                cl_weight=0.0,
+                mask_graph_mode='soft',
+                mask_sharing_mode='separate',
+                mask_specialization_mode='user_js',
+                mask_specialization_weight=0.7,
+                mask_specialization_margin=0.2,
+                mask_specialization_eps=1e-8,
+            )
+
+            image_by_edge = {
+                (0, 0): 0.9,
+                (0, 1): 0.1,
+                (1, 2): 0.5,
+                (2, 1): 0.8,
+                (2, 3): 0.2,
+            }
+            text_by_edge = {
+                (0, 0): 0.1,
+                (0, 1): 0.9,
+                (1, 2): 0.2,
+                (2, 1): 0.8,
+                (2, 3): 0.2,
+            }
+            edges = list(zip(*model.edge_indices.detach().cpu().tolist()))
+            image_probabilities = torch.tensor(
+                [image_by_edge[edge] for edge in edges]
+            )
+            text_probabilities = torch.tensor(
+                [text_by_edge[edge] for edge in edges]
+            )
+            with torch.no_grad():
+                model.image_mask_logits.copy_(
+                    torch.logit(image_probabilities)
+                )
+                model.text_mask_logits.copy_(
+                    torch.logit(text_probabilities)
+                )
+
+            specialization_loss, per_user_js = (
+                model._user_mask_specialization_loss(
+                    model.image_mask_logits,
+                    model.text_mask_logits,
+                )
+            )
+            expected_user_js = torch.zeros(model.n_users)
+            edge_users = model.edge_indices[0]
+            eps = model.mask_specialization_eps
+            for user in range(model.n_users):
+                selected = edge_users == user
+                image_mass = image_probabilities[selected] + eps
+                text_mass = text_probabilities[selected] + eps
+                image_distribution = image_mass / image_mass.sum()
+                text_distribution = text_mass / text_mass.sum()
+                mixture = 0.5 * (
+                    image_distribution + text_distribution
+                )
+                expected_user_js[user] = 0.5 * (
+                    (
+                        image_distribution
+                        * (image_distribution.log() - mixture.log())
+                    ).sum()
+                    + (
+                        text_distribution
+                        * (text_distribution.log() - mixture.log())
+                    ).sum()
+                )
+            expected_loss = F.relu(
+                0.2 - expected_user_js[torch.tensor([0, 2])]
+            ).pow(2).mean()
+            torch.testing.assert_close(per_user_js, expected_user_js)
+            torch.testing.assert_close(specialization_loss, expected_loss)
+            self.assertEqual(per_user_js[1].item(), 0.0)
+
+            loss = model.calculate_loss(self.interaction())
+            torch.testing.assert_close(
+                model.latest_loss_components['mask_specialization'],
+                expected_loss.detach(),
+            )
+            expected_total = (
+                model.latest_loss_components['bpr']
+                + model.mask_weight
+                * model.latest_loss_components['mask']
+                + 0.7
+                * model.latest_loss_components['mask_specialization']
+            )
+            torch.testing.assert_close(loss.detach(), expected_total)
+
+            loss.backward()
+            self.assertTrue(
+                torch.isfinite(model.image_mask_logits.grad).all()
+            )
+            self.assertTrue(
+                torch.isfinite(model.text_mask_logits.grad).all()
+            )
+
+            artifacts = model.get_analysis_artifacts()
+            self.assertEqual(
+                artifacts['metadata']['mask_specialization_mode'],
+                'user_js',
+            )
+            self.assertEqual(
+                artifacts['metadata']['mask_specialization_margin'], 0.2
+            )
+            self.assertEqual(
+                artifacts['mask_specialization'][
+                    'eligible_user_ids'
+                ].tolist(),
+                [0, 2],
+            )
+            torch.testing.assert_close(
+                artifacts['mask_specialization']['per_user_js'],
+                expected_user_js,
+            )
+
+    def test_user_js_specialization_rejects_shared_mask(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_features(root)
+            with self.assertRaisesRegex(
+                ValueError, "requires mask_sharing_mode='separate'"
+            ):
+                self.make_model(
+                    root,
+                    mask_sharing_mode='shared',
+                    mask_specialization_mode='user_js',
+                )
 
     def test_post_training_ranking_summary_reports_rescue_and_harm(self):
         positive_items = [np.array([1]), np.array([2])]

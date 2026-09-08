@@ -124,6 +124,18 @@ class DUAL_MODALITY(GeneralRecommender):
         self.mask_binary_weight = float(
             _config_value(config, 'mask_binary_weight', 0.1)
         )
+        self.mask_specialization_mode = str(
+            _config_value(config, 'mask_specialization_mode', 'none')
+        ).lower()
+        self.mask_specialization_weight = float(
+            _config_value(config, 'mask_specialization_weight', 0.0)
+        )
+        self.mask_specialization_margin = float(
+            _config_value(config, 'mask_specialization_margin', 0.1)
+        )
+        self.mask_specialization_eps = float(
+            _config_value(config, 'mask_specialization_eps', 1e-8)
+        )
         self.mask_graph_mode = str(
             _config_value(config, 'mask_graph_mode', 'hard')
         ).lower()
@@ -168,6 +180,20 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError('mask_keep_ratio must be between 0 and 1.')
         if self.mask_weight < 0.0 or self.mask_binary_weight < 0.0:
             raise ValueError('Mask loss weights must be non-negative.')
+        if self.mask_specialization_mode not in {'none', 'user_js'}:
+            raise ValueError(
+                "mask_specialization_mode must be 'none' or 'user_js'."
+            )
+        if self.mask_specialization_weight < 0.0:
+            raise ValueError(
+                'mask_specialization_weight must be non-negative.'
+            )
+        if not 0.0 <= self.mask_specialization_margin <= math.log(2.0):
+            raise ValueError(
+                'mask_specialization_margin must be in [0, log(2)].'
+            )
+        if self.mask_specialization_eps <= 0.0:
+            raise ValueError('mask_specialization_eps must be positive.')
         if self.cl_weight < 0.0 or self.cl_temperature <= 0.0:
             raise ValueError('Invalid contrastive-learning configuration.')
         if self.cl_mode not in {'pgl_dropout', 'full_masked_concat'}:
@@ -200,6 +226,14 @@ class DUAL_MODALITY(GeneralRecommender):
         if self.mask_sharing_mode not in {'shared', 'separate'}:
             raise ValueError(
                 "mask_sharing_mode must be 'shared' or 'separate'."
+            )
+        if (
+            self.mask_specialization_mode == 'user_js'
+            and self.mask_sharing_mode != 'separate'
+        ):
+            raise ValueError(
+                "mask_specialization_mode='user_js' requires "
+                "mask_sharing_mode='separate'."
             )
         if (
             self.mask_generation_mode == 'feature_network'
@@ -258,6 +292,19 @@ class DUAL_MODALITY(GeneralRecommender):
         edge_values = edge_values.to(self.device)
         self.register_buffer('edge_indices', edge_indices)
         self.register_buffer('edge_values', edge_values)
+        user_interaction_counts = torch.bincount(
+            edge_indices[0], minlength=self.n_users
+        )
+        self.register_buffer(
+            'user_interaction_counts',
+            user_interaction_counts,
+            persistent=False,
+        )
+        self.register_buffer(
+            'specialization_user_mask',
+            user_interaction_counts >= 2,
+            persistent=False,
+        )
 
         forward_edges = torch.stack(
             (edge_indices[0], edge_indices[1] + self.n_users), dim=0
@@ -1096,6 +1143,52 @@ class DUAL_MODALITY(GeneralRecommender):
         neg_scores = torch.sum(torch.mul(users, neg_items), dim=1)
         return -F.logsigmoid(pos_scores - neg_scores).mean()
 
+    def _user_mask_specialization_loss(
+        self, image_mask_logits, text_mask_logits
+    ):
+        """Margin loss on per-user image/text edge distributions."""
+        edge_users = self.edge_indices[0]
+        image_probabilities = torch.sigmoid(image_mask_logits)
+        text_probabilities = torch.sigmoid(text_mask_logits)
+        image_edge_mass = image_probabilities + self.mask_specialization_eps
+        text_edge_mass = text_probabilities + self.mask_specialization_eps
+
+        image_user_mass = image_edge_mass.new_zeros(self.n_users).index_add(
+            0, edge_users, image_edge_mass
+        )
+        text_user_mass = text_edge_mass.new_zeros(self.n_users).index_add(
+            0, edge_users, text_edge_mass
+        )
+        image_distribution = image_edge_mass / image_user_mass.index_select(
+            0, edge_users
+        )
+        text_distribution = text_edge_mass / text_user_mass.index_select(
+            0, edge_users
+        )
+        mixture_distribution = 0.5 * (
+            image_distribution + text_distribution
+        )
+
+        edge_js = 0.5 * (
+            image_distribution
+            * (image_distribution.log() - mixture_distribution.log())
+            + text_distribution
+            * (text_distribution.log() - mixture_distribution.log())
+        )
+        per_user_js = edge_js.new_zeros(self.n_users).index_add(
+            0, edge_users, edge_js
+        )
+        eligible_js = per_user_js[self.specialization_user_mask]
+        if eligible_js.numel() == 0:
+            specialization_loss = (
+                image_mask_logits.sum() + text_mask_logits.sum()
+            ) * 0.0
+        else:
+            specialization_loss = F.relu(
+                self.mask_specialization_margin - eligible_js
+            ).pow(2).mean()
+        return specialization_loss, per_user_js
+
     def InfoNCE(self, view1, view2, temperature):
         view1 = F.normalize(view1, p=2, dim=1, eps=1e-12)
         view2 = F.normalize(view2, p=2, dim=1, eps=1e-12)
@@ -1206,11 +1299,34 @@ class DUAL_MODALITY(GeneralRecommender):
         mask_loss = torch.stack(mask_losses).mean()
         mean_mask_probability = torch.stack(mask_means).mean()
 
+        if (
+            self.mask_specialization_mode == 'user_js'
+            and self.mask_specialization_weight > 0.0
+        ):
+            representations = self.latest_representations
+            specialization_loss, per_user_mask_js = (
+                self._user_mask_specialization_loss(
+                    representations['image_mask_logits'],
+                    representations['text_mask_logits'],
+                )
+            )
+            eligible_user_mask_js = per_user_mask_js[
+                self.specialization_user_mask
+            ]
+            if eligible_user_mask_js.numel() == 0:
+                mean_user_mask_js = ranking_loss.new_zeros(())
+            else:
+                mean_user_mask_js = eligible_user_mask_js.mean()
+        else:
+            specialization_loss = ranking_loss.new_zeros(())
+            mean_user_mask_js = ranking_loss.new_zeros(())
+
         total_loss = (
             ranking_loss
             + self.aux_bpr_weight * auxiliary_ranking_loss
             + self.cl_weight * contrastive_loss
             + self.mask_weight * mask_loss
+            + self.mask_specialization_weight * specialization_loss
         )
         self.latest_loss_components = {
             'bpr': ranking_loss.detach(),
@@ -1220,6 +1336,8 @@ class DUAL_MODALITY(GeneralRecommender):
             'contrastive': contrastive_loss.detach(),
             'mask': mask_loss.detach(),
             'mask_mean': mean_mask_probability.detach(),
+            'mask_specialization': specialization_loss.detach(),
+            'mean_user_mask_js': mean_user_mask_js.detach(),
         }
         return total_loss
 
@@ -1313,6 +1431,30 @@ class DUAL_MODALITY(GeneralRecommender):
                 'selected_at_keep_ratio': selected.detach().cpu(),
             }
 
+        mask_specialization = None
+        if self.mask_sharing_mode == 'separate':
+            latest_mask_logits = dict(self._latest_unique_mask_logits())
+            _, per_user_mask_js = self._user_mask_specialization_loss(
+                latest_mask_logits['image'], latest_mask_logits['text']
+            )
+            eligible_user_ids = torch.nonzero(
+                self.specialization_user_mask, as_tuple=False
+            ).squeeze(1)
+            eligible_user_js = per_user_mask_js[
+                self.specialization_user_mask
+            ]
+            if eligible_user_js.numel() == 0:
+                mean_eligible_user_js = per_user_mask_js.new_zeros(())
+            else:
+                mean_eligible_user_js = eligible_user_js.mean()
+            mask_specialization = {
+                'per_user_js': per_user_mask_js.detach().cpu(),
+                'eligible_user_ids': eligible_user_ids.detach().cpu(),
+                'mean_eligible_user_js': (
+                    mean_eligible_user_js.detach().cpu()
+                ),
+            }
+
         artifacts = {
             'metadata': {
                 'model': self.__class__.__name__,
@@ -1324,6 +1466,16 @@ class DUAL_MODALITY(GeneralRecommender):
                 'fusion_gate_mode': self.fusion_gate_mode,
                 'mask_degree_mode': self.mask_degree_mode,
                 'mask_keep_ratio': self.mask_keep_ratio,
+                'mask_specialization_mode': (
+                    self.mask_specialization_mode
+                ),
+                'mask_specialization_weight': (
+                    self.mask_specialization_weight
+                ),
+                'mask_specialization_margin': (
+                    self.mask_specialization_margin
+                ),
+                'mask_specialization_eps': self.mask_specialization_eps,
                 'n_ui_layers': self.n_ui_layers,
                 'n_mm_layers': self.n_layers,
                 'mm_graph_mode': self.mm_graph_mode,
@@ -1342,6 +1494,7 @@ class DUAL_MODALITY(GeneralRecommender):
                 'item_ids': self.edge_indices[1].detach().cpu(),
             },
             'masks': masks,
+            'mask_specialization': mask_specialization,
             'embedding_tables': {
                 'user_image.weight': self.user_image.weight.detach().cpu(),
                 'masked_user_image.weight': (
