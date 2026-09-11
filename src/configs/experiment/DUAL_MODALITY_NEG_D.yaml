@@ -1,0 +1,5 @@
+# D: CF-filtered pools with downweighted structured examples.
+aux_bpr_mode: modality
+negative_sampler_mode: modality_cf
+structured_negative_ratio: 0.2
+structured_negative_weight: 0.5

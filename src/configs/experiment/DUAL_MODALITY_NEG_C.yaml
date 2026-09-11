@@ -1,0 +1,5 @@
+# C: cross-modality feature pools with train-only CF filtering.
+aux_bpr_mode: modality
+negative_sampler_mode: modality_cf
+structured_negative_ratio: 0.2
+structured_negative_weight: 1.0

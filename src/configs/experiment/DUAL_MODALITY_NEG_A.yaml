@@ -1,0 +1,5 @@
+# A: random-negative modality-BPR baseline.
+aux_bpr_mode: modality
+negative_sampler_mode: random
+structured_negative_ratio: 0.0
+structured_negative_weight: 1.0

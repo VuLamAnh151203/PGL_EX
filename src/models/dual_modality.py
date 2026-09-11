@@ -13,6 +13,7 @@ model remains easy to compare with the original implementation.
 
 import math
 import os
+from logging import getLogger
 
 import numpy as np
 import scipy.sparse as sp
@@ -21,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.abstract_recommender import GeneralRecommender
+from models.modality_negative_sampler import ModalityNegativeSampler
 
 
 def _config_value(config, key, default):
@@ -116,6 +118,30 @@ class DUAL_MODALITY(GeneralRecommender):
         ).lower()
         self.aux_bpr_weight = float(
             _config_value(config, 'aux_bpr_weight', 0.0)
+        )
+        self.negative_sampler_mode = str(
+            _config_value(config, 'negative_sampler_mode', 'random')
+        ).lower()
+        self.structured_negative_ratio = float(
+            _config_value(config, 'structured_negative_ratio', 0.2)
+        )
+        self.structured_negative_weight = float(
+            _config_value(config, 'structured_negative_weight', 1.0)
+        )
+        self.structured_pool_size = int(
+            _config_value(config, 'structured_pool_size', 100)
+        )
+        self.structured_difference_quantile = float(
+            _config_value(config, 'structured_difference_quantile', 0.5)
+        )
+        self.structured_min_item_interactions = int(
+            _config_value(config, 'structured_min_item_interactions', 5)
+        )
+        self.structured_cf_threshold = float(
+            _config_value(config, 'structured_cf_threshold', 0.2)
+        )
+        self.structured_knn_block_size = int(
+            _config_value(config, 'structured_knn_block_size', 256)
         )
         self.mask_keep_ratio = float(
             _config_value(config, 'mask_keep_ratio', 0.3)
@@ -237,6 +263,44 @@ class DUAL_MODALITY(GeneralRecommender):
             )
         if self.aux_bpr_weight < 0.0:
             raise ValueError('aux_bpr_weight must be non-negative.')
+        if self.negative_sampler_mode not in {
+            'random', 'modality', 'modality_cf'
+        }:
+            raise ValueError(
+                "negative_sampler_mode must be 'random', 'modality', or "
+                "'modality_cf'."
+            )
+        if not 0.0 <= self.structured_negative_ratio <= 1.0:
+            raise ValueError('structured_negative_ratio must be in [0, 1].')
+        if self.structured_negative_weight < 0.0:
+            raise ValueError(
+                'structured_negative_weight must be non-negative.'
+            )
+        if self.structured_pool_size <= 0:
+            raise ValueError('structured_pool_size must be positive.')
+        if not 0.0 <= self.structured_difference_quantile <= 1.0:
+            raise ValueError(
+                'structured_difference_quantile must be in [0, 1].'
+            )
+        if self.structured_min_item_interactions < 0:
+            raise ValueError(
+                'structured_min_item_interactions must be non-negative.'
+            )
+        if not 0.0 <= self.structured_cf_threshold <= 1.0:
+            raise ValueError('structured_cf_threshold must be in [0, 1].')
+        if self.structured_knn_block_size <= 0:
+            raise ValueError('structured_knn_block_size must be positive.')
+        if (
+            self.negative_sampler_mode != 'random'
+            and self.structured_negative_ratio > 0.0
+            and self.aux_bpr_mode == 'masked_branch'
+            and self.aux_bpr_weight > 0.0
+        ):
+            raise ValueError(
+                'Structured modality negatives require '
+                "aux_bpr_mode='modality'; the guideline explicitly uses "
+                'post-fusion modality embeddings, not masked branches.'
+            )
         if not 0.0 <= self.cl_dropout < 1.0:
             raise ValueError('dropout must be in [0, 1).')
         if self.mask_graph_mode not in {'soft', 'hard'}:
@@ -357,6 +421,72 @@ class DUAL_MODALITY(GeneralRecommender):
         if self.interaction_matrix.nnz == 0:
             raise ValueError('DUAL_MODALITY requires at least one interaction.')
         self.num_interactions = self.interaction_matrix.nnz
+
+        item_interaction_counts = np.asarray(
+            (self.interaction_matrix.tocsr() > 0).sum(axis=0)
+        ).reshape(-1)
+        self.register_buffer(
+            'structured_item_interaction_counts',
+            torch.as_tensor(
+                item_interaction_counts,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            persistent=False,
+        )
+        self.structured_sampler_enabled = (
+            self.aux_bpr_mode == 'modality'
+            and self.aux_bpr_weight > 0.0
+            and self.negative_sampler_mode != 'random'
+            and self.structured_negative_ratio > 0.0
+        )
+        self.negative_sampler = None
+        self.negative_sampler_preprocessing_seconds = 0.0
+        if self.structured_sampler_enabled:
+            dataset_path = os.path.abspath(
+                os.path.join(
+                    str(config['data_path']), str(config['dataset'])
+                )
+            )
+            sampler_seed = _config_value(config, 'seed', 0)
+            if isinstance(sampler_seed, (list, tuple)):
+                sampler_seed = sampler_seed[0]
+            self.negative_sampler = ModalityNegativeSampler(
+                image_features=self.v_feat,
+                text_features=self.t_feat,
+                interaction_matrix=self.interaction_matrix,
+                mode=self.negative_sampler_mode,
+                structured_ratio=self.structured_negative_ratio,
+                structured_weight=self.structured_negative_weight,
+                pool_size=self.structured_pool_size,
+                difference_quantile=(
+                    self.structured_difference_quantile
+                ),
+                min_item_interactions=(
+                    self.structured_min_item_interactions
+                ),
+                cf_threshold=self.structured_cf_threshold,
+                seed=sampler_seed,
+                cache_directory=dataset_path,
+                knn_block_size=self.structured_knn_block_size,
+            )
+            self.negative_sampler_preprocessing_seconds = (
+                self.negative_sampler.preprocessing_seconds
+            )
+            pool_summary = self.negative_sampler.pool_summary()
+            getLogger().info(
+                'Structured negative pools prepared in %.3fs '
+                '[cache_hit=%s, image mean/nonempty=%.2f/%.3f, '
+                'text mean/nonempty=%.2f/%.3f, file=%s]',
+                self.negative_sampler_preprocessing_seconds,
+                self.negative_sampler.cache_hit,
+                pool_summary['image']['mean_size'],
+                pool_summary['image']['non_empty_fraction'],
+                pool_summary['text']['mean_size'],
+                pool_summary['text']['non_empty_fraction'],
+                self.negative_sampler.cache_file,
+            )
+        self._reset_negative_sampling_epoch_stats()
 
         edge_indices, edge_values = self.get_edge_info()
         edge_indices = edge_indices.to(self.device)
@@ -719,6 +849,134 @@ class DUAL_MODALITY(GeneralRecommender):
             raise ValueError("modality must be 'image' or 'text'.")
         return torch.sigmoid(logit)
 
+    def _reset_negative_sampling_epoch_stats(self):
+        self._negative_sampling_epoch_stats = {
+            modality: {
+                'examples': 0,
+                'attempts': 0,
+                'structured': 0,
+                'weight_sum': 0.0,
+                'random': {
+                    'count': 0,
+                    'popularity_sum': 0.0,
+                    'margin_sum': 0.0,
+                    'loss_sum': 0.0,
+                },
+                'structured_group': {
+                    'count': 0,
+                    'popularity_sum': 0.0,
+                    'margin_sum': 0.0,
+                    'loss_sum': 0.0,
+                },
+            }
+            for modality in ('image', 'text')
+        }
+
+    @staticmethod
+    def _weighted_bpr_details(
+        users, positive_items, negative_items, weights
+    ):
+        positive_scores = torch.sum(users * positive_items, dim=1)
+        negative_scores = torch.sum(users * negative_items, dim=1)
+        margins = positive_scores - negative_scores
+        per_example_loss = F.softplus(-margins)
+        return (
+            (weights * per_example_loss).mean(),
+            margins,
+            per_example_loss,
+        )
+
+    @torch.no_grad()
+    def _record_negative_sampling_batch(
+        self, modality, sample, margins, per_example_loss
+    ):
+        stats = self._negative_sampling_epoch_stats[modality]
+        structured = sample['structured']
+        attempted = sample['attempted']
+        weights = sample['weights']
+        negatives = sample['negative_items']
+        batch_size = int(negatives.numel())
+        stats['examples'] += batch_size
+        stats['attempts'] += int(attempted.sum().item())
+        stats['structured'] += int(structured.sum().item())
+        stats['weight_sum'] += float(weights.sum().item())
+
+        popularity = self.structured_item_interaction_counts[negatives]
+        weighted_losses = weights * per_example_loss
+        for group_name, group_mask in (
+            ('random', ~structured),
+            ('structured_group', structured),
+        ):
+            count = int(group_mask.sum().item())
+            if count == 0:
+                continue
+            group = stats[group_name]
+            group['count'] += count
+            group['popularity_sum'] += float(
+                popularity[group_mask].sum().item()
+            )
+            group['margin_sum'] += float(margins[group_mask].sum().item())
+            group['loss_sum'] += float(
+                weighted_losses[group_mask].sum().item()
+            )
+
+    def _negative_sampling_epoch_message(self):
+        if not self.structured_sampler_enabled:
+            return None
+
+        modality_messages = []
+        for modality in ('image', 'text'):
+            stats = self._negative_sampling_epoch_stats[modality]
+            examples = stats['examples']
+            attempts = stats['attempts']
+            successes = stats['structured']
+            if examples == 0:
+                continue
+
+            def group_mean(group_name, field):
+                group = stats[group_name]
+                return (
+                    group[field] / group['count']
+                    if group['count'] > 0
+                    else 0.0
+                )
+
+            modality_messages.append(
+                '{modality}: attempt={attempt:.3f}, success={success:.3f}, '
+                'fallback/attempt={fallback:.3f}, mean_weight={weight:.3f}, '
+                'random[n={random_n}, pop={random_pop:.3f}, '
+                'margin={random_margin:.4f}, loss={random_loss:.4f}], '
+                'structured[n={structured_n}, pop={structured_pop:.3f}, '
+                'margin={structured_margin:.4f}, loss={structured_loss:.4f}]'
+                .format(
+                    modality=modality,
+                    attempt=attempts / examples,
+                    success=successes / examples,
+                    fallback=(attempts - successes) / attempts
+                    if attempts > 0 else 0.0,
+                    weight=stats['weight_sum'] / examples,
+                    random_n=stats['random']['count'],
+                    random_pop=group_mean('random', 'popularity_sum'),
+                    random_margin=group_mean('random', 'margin_sum'),
+                    random_loss=group_mean('random', 'loss_sum'),
+                    structured_n=stats['structured_group']['count'],
+                    structured_pop=group_mean(
+                        'structured_group', 'popularity_sum'
+                    ),
+                    structured_margin=group_mean(
+                        'structured_group', 'margin_sum'
+                    ),
+                    structured_loss=group_mean(
+                        'structured_group', 'loss_sum'
+                    ),
+                )
+            )
+        if not modality_messages:
+            return None
+        return 'structured negative sampling [{}]'.format(
+            ' | '.join(modality_messages)
+        )
+
     @torch.no_grad()
     def _sample_hard_indices(self, mask_logits):
         uniform_noise = torch.rand_like(mask_logits).clamp_(
@@ -737,6 +995,7 @@ class DUAL_MODALITY(GeneralRecommender):
         ).indices
 
     def pre_epoch_processing(self):
+        self._reset_negative_sampling_epoch_stats()
         if self.mask_graph_mode == 'hard':
             with torch.no_grad():
                 if self.mask_generation_mode == 'feature_network':
@@ -755,6 +1014,7 @@ class DUAL_MODALITY(GeneralRecommender):
                     )
 
     def post_epoch_processing(self):
+        messages = []
         if self.mask_graph_mode == 'hard':
             with torch.no_grad():
                 if self.mask_generation_mode == 'feature_network':
@@ -776,7 +1036,7 @@ class DUAL_MODALITY(GeneralRecommender):
             if diagnostics is not None:
                 image = diagnostics['relative_weights']['image']
                 text = diagnostics['relative_weights']['text']
-                return (
+                messages.append((
                     'normalized mask weights '
                     '[mode: {mode}, gamma_v: {gamma_v:.4f}, '
                     'gamma_t: {gamma_t:.4f}, '
@@ -798,8 +1058,11 @@ class DUAL_MODALITY(GeneralRecommender):
                     it_q05=text['q05'],
                     it_q95=text['q95'],
                     js=diagnostics['mean_eligible_user_js'],
-                )
-        return None
+                ))
+        negative_sampling_message = self._negative_sampling_epoch_message()
+        if negative_sampling_message is not None:
+            messages.append(negative_sampling_message)
+        return '\n'.join(messages) if messages else None
 
     @staticmethod
     def _distribution_summary(values):
@@ -1635,6 +1898,7 @@ class DUAL_MODALITY(GeneralRecommender):
         ranking_loss = self.bpr_loss(
             user_embeddings, positive_embeddings, negative_embeddings
         )
+        sampling_components = {}
 
         if (
             self.aux_bpr_mode != 'none'
@@ -1652,16 +1916,79 @@ class DUAL_MODALITY(GeneralRecommender):
                 text_users = representations['text_users']
                 text_items = representations['text_items']
 
-            image_ranking_loss = self.bpr_loss(
-                image_users[users],
-                image_items[pos_items],
-                image_items[neg_items],
-            )
-            text_ranking_loss = self.bpr_loss(
-                text_users[users],
-                text_items[pos_items],
-                text_items[neg_items],
-            )
+            if self.structured_sampler_enabled:
+                image_sample = self.negative_sampler.sample(
+                    'image', users, pos_items, neg_items
+                )
+                text_sample = self.negative_sampler.sample(
+                    'text', users, pos_items, neg_items
+                )
+                (
+                    image_ranking_loss,
+                    image_margins,
+                    image_per_example_loss,
+                ) = self._weighted_bpr_details(
+                    image_users[users],
+                    image_items[pos_items],
+                    image_items[image_sample['negative_items']],
+                    image_sample['weights'],
+                )
+                (
+                    text_ranking_loss,
+                    text_margins,
+                    text_per_example_loss,
+                ) = self._weighted_bpr_details(
+                    text_users[users],
+                    text_items[pos_items],
+                    text_items[text_sample['negative_items']],
+                    text_sample['weights'],
+                )
+                self._record_negative_sampling_batch(
+                    'image',
+                    image_sample,
+                    image_margins,
+                    image_per_example_loss,
+                )
+                self._record_negative_sampling_batch(
+                    'text',
+                    text_sample,
+                    text_margins,
+                    text_per_example_loss,
+                )
+                for modality, sample in (
+                    ('image', image_sample), ('text', text_sample)
+                ):
+                    batch_size = sample['negative_items'].numel()
+                    attempts = sample['attempted'].sum()
+                    successes = sample['structured'].sum()
+                    sampling_components.update({
+                        '{}_structured_attempt_rate'.format(modality): (
+                            attempts.float() / batch_size
+                        ),
+                        '{}_structured_success_rate'.format(modality): (
+                            successes.float() / batch_size
+                        ),
+                        '{}_structured_fallback_rate'.format(modality): (
+                            (attempts - successes).float()
+                            / attempts.clamp_min(1)
+                        ),
+                        '{}_negative_mean_weight'.format(modality): (
+                            sample['weights'].mean()
+                        ),
+                    })
+            else:
+                # Keep the exact baseline path: no extra sampler RNG and no
+                # change to the original unweighted reduction.
+                image_ranking_loss = self.bpr_loss(
+                    image_users[users],
+                    image_items[pos_items],
+                    image_items[neg_items],
+                )
+                text_ranking_loss = self.bpr_loss(
+                    text_users[users],
+                    text_items[pos_items],
+                    text_items[neg_items],
+                )
             auxiliary_ranking_loss = 0.5 * (
                 image_ranking_loss + text_ranking_loss
             )
@@ -1831,6 +2158,10 @@ class DUAL_MODALITY(GeneralRecommender):
             'mask_specialization': specialization_loss.detach(),
             'mean_user_mask_js': mean_user_mask_js.detach(),
         }
+        self.latest_loss_components.update({
+            key: value.detach()
+            for key, value in sampling_components.items()
+        })
         return total_loss
 
     def full_sort_predict(self, interaction):
@@ -2022,6 +2353,24 @@ class DUAL_MODALITY(GeneralRecommender):
                 'cl_mode': self.cl_mode,
                 'aux_bpr_mode': self.aux_bpr_mode,
                 'aux_bpr_weight': self.aux_bpr_weight,
+                'negative_sampler_mode': self.negative_sampler_mode,
+                'structured_negative_ratio': (
+                    self.structured_negative_ratio
+                ),
+                'structured_negative_weight': (
+                    self.structured_negative_weight
+                ),
+                'structured_pool_size': self.structured_pool_size,
+                'structured_difference_quantile': (
+                    self.structured_difference_quantile
+                ),
+                'structured_min_item_interactions': (
+                    self.structured_min_item_interactions
+                ),
+                'structured_cf_threshold': self.structured_cf_threshold,
+                'structured_knn_block_size': (
+                    self.structured_knn_block_size
+                ),
                 'num_users': self.n_users,
                 'num_items': self.n_items,
                 'num_interactions': self.num_interactions,
@@ -2034,6 +2383,25 @@ class DUAL_MODALITY(GeneralRecommender):
             'masks': masks,
             'normalized_edge_weights': normalized_edge_weights,
             'mask_specialization': mask_specialization,
+            'negative_sampling': (
+                {
+                    'enabled': True,
+                    'cache_file': self.negative_sampler.cache_file,
+                    'cache_hit': self.negative_sampler.cache_hit,
+                    'preprocessing_seconds': (
+                        self.negative_sampler_preprocessing_seconds
+                    ),
+                    'pool_summary': self.negative_sampler.pool_summary(),
+                    'cached_cf_pairs': len(
+                        self.negative_sampler._cf_cache
+                    ),
+                }
+                if self.structured_sampler_enabled
+                else {
+                    'enabled': False,
+                    'preprocessing_seconds': 0.0,
+                }
+            ),
             'embedding_tables': {
                 'user_image.weight': self.user_image.weight.detach().cpu(),
                 'masked_user_image.weight': (

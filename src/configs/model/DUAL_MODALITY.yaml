@@ -76,6 +76,19 @@ dropout: 0.2
 aux_bpr_mode: masked_branch
 aux_bpr_weight: 0.1
 
+# Auxiliary-modality negative sampling. ``random`` is the backward-compatible
+# baseline and builds no extra pool. Structured modes require
+# aux_bpr_mode: modality when aux_bpr_weight is non-zero.
+negative_sampler_mode: random  # random | modality | modality_cf
+structured_negative_ratio: 0.2
+structured_negative_weight: 1.0
+structured_pool_size: 100
+structured_difference_quantile: 0.5
+structured_min_item_interactions: 5
+structured_cf_threshold: 0.2  # used only by modality_cf
+# KNN is computed in query blocks; no dense n_items x n_items matrix is kept.
+structured_knn_block_size: 256
+
 save_analysis_artifacts: True
 restore_best_model: True
 
